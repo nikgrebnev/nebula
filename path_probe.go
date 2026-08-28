@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"net/netip"
 	"slices"
+	"sort"
 	"time"
 )
 
@@ -311,4 +312,65 @@ func (p *pathProbeState) describe() string {
 		s += name + "=" + l.rtt.Round(time.Millisecond/10).String()
 	}
 	return s
+}
+
+// chooseLeg picks which measured path to pin.
+//
+// With spread at zero this is simply the fastest path, which is what the probe
+// did originally and what "best path" plainly means. That worked too well: on a
+// live network of seventeen nodes it converged 83-89% of all relayed pairs onto
+// one relay, and losing that relay costs twenty seconds for every pair riding
+// it. Round trip time is measurable, a single point of failure is not, so it has
+// to be designed against rather than measured away.
+//
+// With spread set, any path within that percentage of the fastest counts as
+// equally good, and one of the equals is chosen by a stable per-pair number.
+// Different pairs then land on different relays, while any one pair stays put
+// across rounds and across restarts - a choice that moved every round would be
+// worse than concentration.
+//
+// A direct path always wins a tie, whatever the seed says: it puts no load on
+// any third node, so there is never a reason to pass it over.
+func chooseLeg(legs []probeLeg, spreadPct int, seed uint64) (probeLeg, bool) {
+	var best probeLeg
+	found := false
+	for _, l := range legs {
+		if !l.got {
+			continue
+		}
+		if !found || l.rtt < best.rtt {
+			best = l
+			found = true
+		}
+	}
+	if !found || spreadPct <= 0 {
+		return best, found
+	}
+
+	// Cutoff is inclusive so that spread of zero percent would still admit exact
+	// ties, and so a path equal to the fastest is never excluded by rounding.
+	cutoff := best.rtt + best.rtt*time.Duration(spreadPct)/100
+
+	var equals []probeLeg
+	for _, l := range legs {
+		if !l.got || l.rtt > cutoff {
+			continue
+		}
+		if !l.relay.IsValid() {
+			// The direct path. Nothing beats costing no one anything.
+			return l, true
+		}
+		equals = append(equals, l)
+	}
+	if len(equals) <= 1 {
+		return best, true
+	}
+
+	// Sort by address so the order does not depend on the order the probe
+	// happened to fill its legs in; otherwise the same seed would pick a
+	// different relay from round to round.
+	sort.Slice(equals, func(i, j int) bool {
+		return equals[i].relay.Compare(equals[j].relay) < 0
+	})
+	return equals[seed%uint64(len(equals))], true
 }

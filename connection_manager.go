@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"net/netip"
 	"sync"
@@ -58,6 +59,11 @@ type connectionManager struct {
 	// moved onto it, so a pair of near-equal paths is not swapped back and
 	// forth on measurement noise.
 	pathProbeMargin atomic.Int64
+
+	// pathProbeSpread is how far behind the fastest path another path may
+	// sit and still count as equally good, in percent. Zero keeps the old
+	// behaviour of always pinning the single fastest path.
+	pathProbeSpread atomic.Int64
 	// probeRound numbers rounds so a late reply from a previous one is ignored.
 	probeRound atomic.Uint64
 
@@ -114,6 +120,7 @@ func (cm *connectionManager) reload(c *config.C, initial bool) {
 		old := time.Duration(cm.pathProbeInterval.Load())
 		cm.pathProbeInterval.Store((int64)(c.GetDuration("timers.path_probe_interval", 0)))
 		cm.pathProbeMargin.Store((int64)(c.GetDuration("timers.path_probe_margin", 10*time.Millisecond)))
+		cm.pathProbeSpread.Store((int64)(c.GetInt("timers.path_probe_spread", 0)))
 		if initial {
 			cm.l.Info("Path probe configured",
 				"interval", time.Duration(cm.pathProbeInterval.Load()),
@@ -704,6 +711,25 @@ func (cm *connectionManager) askForRelay(hostinfo *HostInfo, relay netip.Addr) {
 		relayHostInfo, hostinfo.vpnAddrs[0])
 }
 
+// pairSeed is a stable number for this pair of nodes, used to spread equally
+// good paths. It must depend on BOTH ends: seeding from the peer alone would
+// make every node pick the same relay for that peer, which is the concentration
+// this is meant to undo.
+func (cm *connectionManager) pairSeed(hostinfo *HostInfo) uint64 {
+	h := fnv.New64a()
+	if cm.intf != nil {
+		for _, a := range cm.intf.myVpnAddrs {
+			b := a.As16()
+			h.Write(b[:])
+		}
+	}
+	for _, a := range hostinfo.vpnAddrs {
+		b := a.As16()
+		h.Write(b[:])
+	}
+	return h.Sum64()
+}
+
 // judgePathProbe acts on a finished round and says in the log what it saw, so a
 // tunnel sitting on a slow path is visible there and not only in round trip
 // time.
@@ -724,8 +750,7 @@ func (cm *connectionManager) judgePathProbe(hostinfo *HostInfo, p *pathProbeStat
 	}
 	hostinfo.forgetPaths(keep)
 
-	var best probeLeg
-	haveBest := false
+	var live []probeLeg
 	for _, l := range p.legs {
 		// A path has to be alive NOW to be chosen. Looking back over rounds is
 		// what stops a single swing from moving traffic, but the remembered
@@ -739,11 +764,12 @@ func (cm *connectionManager) judgePathProbe(hostinfo *HostInfo, p *pathProbeStat
 		if !ok {
 			continue
 		}
-		if !haveBest || typ < best.rtt {
-			best = probeLeg{relay: l.relay, rtt: typ, got: true}
-			haveBest = true
-		}
+		live = append(live, probeLeg{relay: l.relay, rtt: typ, got: true})
 	}
+
+	// Among paths that measure the same, spread the load instead of piling every
+	// pair onto the single fastest relay. See chooseLeg for why.
+	best, haveBest := chooseLeg(live, int(cm.pathProbeSpread.Load()), cm.pairSeed(hostinfo))
 
 	if !haveBest {
 		// Silence is not evidence that the path in use is bad, so nothing moves.
