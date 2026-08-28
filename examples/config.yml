@@ -242,6 +242,9 @@ relay:
   # IPs in this list must have am_relay set to true in their configs, otherwise
   # they will reject relay requests.
   #relays:
+  # A relay may still use relays of its own: forwarding for others and being
+  # forwarded are independent. Chains cannot form regardless, because a relay
+  # only forwards to peers it holds a direct tunnel with.
     #- 192.168.100.1
     #- <other Nebula VPN IPs of hosts used as relays to access me>
   # Set am_relay to true to permit other hosts to list my IP in their relays config. Default false.

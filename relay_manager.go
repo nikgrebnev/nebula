@@ -41,7 +41,15 @@ func (rm *relayManager) reload(c *config.C, initial bool) error {
 	if initial || c.HasChanged("relay.am_relay") || c.HasChanged("relay.use_relays") {
 		amRelay := c.GetBool("relay.am_relay", false)
 		rm.amRelay.Store(amRelay)
-		rm.useRelays.Store(c.GetBool("relay.use_relays", true) && !amRelay)
+		// Forwarding for others and being forwarded are independent: a relay may
+		// still need a relay of its own to reach a peer it has no path to. Tying
+		// the two together left such a node walking a bad direct route instead
+		// of a short relayed one — measured on a host where the direct path to
+		// a peer in another datacenter is 155ms, while the same peer reached
+		// through a nearby relay is 12ms.
+		// Chains stay impossible without this coupling: handleCreateRelayRequest
+		// forwards only to peers this node holds a direct tunnel with.
+		rm.useRelays.Store(c.GetBool("relay.use_relays", true))
 	}
 	return nil
 }

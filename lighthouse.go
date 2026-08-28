@@ -346,30 +346,31 @@ func (lh *LightHouse) reload(c *config.C, initial bool) error {
 	}
 
 	if initial || c.HasChanged("relay.relays") {
-		switch c.GetBool("relay.am_relay", false) {
-		case true:
-			// Relays aren't allowed to specify other relays
-			if len(c.GetStringSlice("relay.relays", nil)) > 0 {
-				lh.l.Info("Ignoring relays from config because am_relay is true")
+		// A relay may use relays of its own. Forwarding for others and being
+		// forwarded are separate things, and only their combination — passing
+		// somebody else's traffic on through a third node — would build a
+		// chain the protocol cannot express, since a packet carries room for
+		// one relay index and not a path.
+		//
+		// That combination is already impossible: handleCreateRelayRequest
+		// forwards only to peers it holds a direct tunnel with ("Only create
+		// relays to peers for whom I have a direct connection"). Blanking the
+		// list here on top of that bought nothing and cost a relay the fallback
+		// every other node keeps.
+		relaysForMe := []netip.Addr{}
+		for _, v := range c.GetStringSlice("relay.relays", nil) {
+			configRIP, err := netip.ParseAddr(v)
+			if err != nil {
+				lh.l.Warn("Parse relay from config failed",
+					"relay", v,
+					"error", err,
+				)
+			} else {
+				lh.l.Info("Read relay from config", "relay", v)
+				relaysForMe = append(relaysForMe, configRIP)
 			}
-			relaysForMe := []netip.Addr{}
-			lh.relaysForMe.Store(&relaysForMe)
-		case false:
-			relaysForMe := []netip.Addr{}
-			for _, v := range c.GetStringSlice("relay.relays", nil) {
-				configRIP, err := netip.ParseAddr(v)
-				if err != nil {
-					lh.l.Warn("Parse relay from config failed",
-						"relay", v,
-						"error", err,
-					)
-				} else {
-					lh.l.Info("Read relay from config", "relay", v)
-					relaysForMe = append(relaysForMe, configRIP)
-				}
-			}
-			lh.relaysForMe.Store(&relaysForMe)
 		}
+		lh.relaysForMe.Store(&relaysForMe)
 	}
 
 	return nil

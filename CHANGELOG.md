@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A relay may now use relays of its own. Forwarding for others and being
+  forwarded are independent, and tying them together left a relay walking a
+  bad direct route instead of a short relayed one. Chains still cannot form.
+
 ### Changed
 
 - IPv6 packets whose next header is a protocol Nebula does not parse (SCTP, GRE, IP-in-IP, etc.) are now
