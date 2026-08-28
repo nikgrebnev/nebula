@@ -67,6 +67,12 @@ type ControlHostInfo struct {
 	CurrentRemote          netip.AddrPort   `json:"currentRemote"`
 	CurrentRelaysToMe      []netip.Addr     `json:"currentRelaysToMe"`
 	CurrentRelaysThroughMe []netip.Addr     `json:"currentRelaysThroughMe"`
+	// PinnedRelay is the relay timers.path_probe_interval measured as fastest
+	// and put this peer's traffic on. It is empty when traffic follows the
+	// ordinary rules, which is also the case when path probing is off.
+	// Without it the only way to ask which path a peer is on is to grep the log
+	// for the last decision, which is no way to answer a question.
+	PinnedRelay netip.Addr `json:"pinnedRelay"`
 }
 
 // Start actually runs nebula, this is a nonblocking call.
@@ -385,6 +391,7 @@ func copyHostInfo(h *HostInfo, preferredRanges []netip.Prefix) ControlHostInfo {
 		CurrentRelaysToMe:      h.relayState.CopyRelayIps(),
 		CurrentRelaysThroughMe: h.relayState.CopyRelayForIps(),
 		CurrentRemote:          h.GetRemote(),
+		PinnedRelay:            h.PinnedRelay(),
 	}
 
 	for i, a := range h.vpnAddrs {

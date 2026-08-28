@@ -280,6 +280,22 @@ type HostInfo struct {
 	// choice; a tunnel that fell back to a relay stays on it even after the
 	// direct path recovers.
 	pathCheckedAt time.Time
+
+	// pinnedRelay, when set, sends this peer's traffic through that relay even
+	// though a direct remote exists. It is set by timers.path_probe_interval,
+	// which measures the paths instead of trusting the handshake race.
+	pinnedRelay atomic.Pointer[netip.Addr]
+
+	// probeMu guards the path probe round in flight and the stamp of the last
+	// one. Both are touched by the connection manager tick and by replies
+	// arriving on the read path.
+	probeMu     sync.Mutex
+	probe       *pathProbeState
+	lastProbeAt time.Time
+	// pathHistory remembers what each path recently cost, so a decision can look
+	// at what a path usually does instead of what it did once.
+	pathHistory map[netip.Addr][]time.Duration
+
 	// lastUsed tracks the last time ConnectionManager checked the tunnel and it was in use.
 	// This value will be behind against actual tunnel utilization in the hot path.
 	// This should only be used by the ConnectionManagers ticker routine.
