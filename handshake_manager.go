@@ -23,10 +23,12 @@ const (
 	DefaultHandshakeTryInterval   = time.Millisecond * 100
 	DefaultHandshakeRetries       = 10
 	DefaultHandshakeTriggerBuffer = 64
+	// DefaultHandshakeCachedPackets keeps the historical hard-coded limit.
+	DefaultHandshakeCachedPackets = 100
 
 	// maxCachedPackets is how many unsent packets we'll buffer per pending
 	// handshake before dropping further ones.
-	maxCachedPackets = 100
+	maxCachedPackets = DefaultHandshakeCachedPackets
 
 	// HandshakePacket map keys mirror the IX protocol stage convention:
 	//   stage 0 = the initiator's first message (and what the responder
@@ -42,6 +44,7 @@ var (
 		tryInterval:   DefaultHandshakeTryInterval,
 		retries:       DefaultHandshakeRetries,
 		triggerBuffer: DefaultHandshakeTriggerBuffer,
+		cachedPackets: DefaultHandshakeCachedPackets,
 	}
 )
 
@@ -49,6 +52,10 @@ type HandshakeConfig struct {
 	tryInterval   time.Duration
 	retries       int64
 	triggerBuffer int
+	// cachedPackets bounds how many packets wait per pending tunnel.
+	// Busy nodes overflow the historical 100 while the tunnel is still
+	// coming up, and every overflowed packet is application data lost.
+	cachedPackets int
 
 	messageMetrics *MessageMetrics
 }
@@ -84,6 +91,7 @@ type HandshakeHostInfo struct {
 	counter                   int64            // How many attempts have we made so far
 	lastRemotes               []netip.AddrPort // Remotes that we sent to during the previous attempt
 	lastRelays                []netip.Addr     // Relays we attempted to use during the previous attempt
+	maxPacketStore            int              // Ceiling for packetStore, from handshakes.cached_packets
 	packetStore               []*cachedPacket  // A set of packets to be transmitted once the handshake completes
 
 	hostinfo *HostInfo
@@ -91,7 +99,11 @@ type HandshakeHostInfo struct {
 }
 
 func (hh *HandshakeHostInfo) cachePacket(l *slog.Logger, t header.MessageType, st header.MessageSubType, packet []byte, f packetCallback, m *cachedPacketMetrics) {
-	if len(hh.packetStore) < maxCachedPackets {
+	limit := hh.maxPacketStore
+	if limit <= 0 {
+		limit = maxCachedPackets
+	}
+	if len(hh.packetStore) < limit {
 		tempPacket := make([]byte, len(packet))
 		copy(tempPacket, packet)
 
@@ -379,8 +391,9 @@ func (hm *HandshakeManager) StartHandshake(vpnAddr netip.Addr, cacheCb func(*Han
 	}
 
 	hh := &HandshakeHostInfo{
-		hostinfo:  hostinfo,
-		startTime: time.Now(),
+		hostinfo:       hostinfo,
+		startTime:      time.Now(),
+		maxPacketStore: hm.config.cachedPackets,
 	}
 	hm.vpnIps[vpnAddr] = hh
 	hm.metricInitiated.Inc(1)

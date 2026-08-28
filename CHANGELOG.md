@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `handshakes.cached_packets` sets how many packets wait per tunnel that is
+  still being established. The ceiling was hard coded at 100, which on a busy
+  node drops more than half the waiting packets even when the tunnel comes up
+  fine. Defaults to the previous value of 100.
+
 ### Changed
 
 - IPv6 packets whose next header is a protocol Nebula does not parse (SCTP, GRE, IP-in-IP, etc.) are now
