@@ -494,6 +494,11 @@ logging:
   # query_buffer is the size of the buffer channel for querying lighthouses
   #query_buffer: 64
 
+  # cached_packets is how many packets wait per pending tunnel. Packets beyond
+  # this are dropped: on a busy node the tunnel can take long enough to come up
+  # that the historical 100 overflows, and every overflowed packet is lost data.
+  #cached_packets: 100
+
   # trigger_buffer is the size of the buffer channel for quickly sending handshakes
   # after receiving the response for lighthouse queries
   #trigger_buffer: 64

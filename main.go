@@ -228,6 +228,7 @@ func Main(c *config.C, configTest bool, buildVersion string, l *slog.Logger, dev
 		tryInterval:    c.GetDuration("handshakes.try_interval", DefaultHandshakeTryInterval),
 		retries:        int64(c.GetInt("handshakes.retries", DefaultHandshakeRetries)),
 		triggerBuffer:  c.GetInt("handshakes.trigger_buffer", DefaultHandshakeTriggerBuffer),
+		cachedPackets:  c.GetInt("handshakes.cached_packets", DefaultHandshakeCachedPackets),
 		messageMetrics: messageMetrics,
 	}
 
