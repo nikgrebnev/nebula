@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/netip"
 	"strings"
+	"sync"
 
 	"github.com/rcrowley/go-metrics"
 	"github.com/slackhq/nebula/iputil"
@@ -15,7 +16,12 @@ import (
 )
 
 type disabledTun struct {
-	read        chan []byte
+	read chan []byte
+	// closed is shut instead of read: a sender racing a close of read would
+	// panic, so the channel packets travel on is never closed at all. Readers
+	// and senders watch this one to learn the device is going away.
+	closed      chan struct{}
+	closeOnce   sync.Once
 	vpnNetworks []netip.Prefix
 
 	// Track these metrics since we don't have the tun device to do it for us
@@ -28,9 +34,18 @@ type disabledTun struct {
 // from concurrent queues are safe: the channel receive serializes them and
 // each queue copies into its own private scratch buffer.
 func (t *disabledTun) Read(b []byte) (int, error) {
-	r, ok := <-t.read
-	if !ok {
-		return 0, io.EOF
+	var r []byte
+	select {
+	case r = <-t.read:
+	default:
+		// Nothing queued: now it matters whether the device is going away.
+		// Draining first keeps the old behaviour, where closing the channel let
+		// a reader take what was already queued before it saw the close.
+		select {
+		case r = <-t.read:
+		case <-t.closed:
+			return 0, io.EOF
+		}
 	}
 
 	t.tx.Inc(1)
@@ -43,6 +58,7 @@ func (t *disabledTun) Read(b []byte) (int, error) {
 
 func newDisabledTun(vpnNetworks []netip.Prefix, queueLen int, metricsEnabled bool, l *slog.Logger) *disabledTun {
 	tun := &disabledTun{
+		closed:      make(chan struct{}),
 		vpnNetworks: vpnNetworks,
 		read:        make(chan []byte, queueLen),
 		l:           l,
@@ -116,11 +132,14 @@ func (t *disabledTun) Queues(n int) ([]tio.Queue, error) {
 	return out, nil
 }
 
+// Close is safe to call more than once and safe to call while readers and
+// senders are running. It does not touch t.read: writing that field is what the
+// race detector flagged, and closing it would turn a concurrent send into a
+// panic.
 func (t *disabledTun) Close() error {
-	if t.read != nil {
-		close(t.read)
-		t.read = nil
-	}
+	t.closeOnce.Do(func() {
+		close(t.closed)
+	})
 	return nil
 }
 

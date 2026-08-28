@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Closing a disabled tun no longer races the read loop, and no longer leaves a
+  reader parked forever. `go test -race ./cmd/nebula` passes.
 - The ICMPv6 type was read from the wrong byte when classifying IPv6 packets, so the echo identifier used
   for conntrack was never picked up. (#1840)
 
