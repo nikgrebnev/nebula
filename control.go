@@ -51,6 +51,7 @@ type Control struct {
 	cancel                 context.CancelFunc
 	sshStart               func()
 	statsStart             func()
+	statusStart            func()
 	dnsStart               func()
 	lighthouseStart        func()
 	networkChangeStart     func(rebind func())
@@ -67,6 +68,10 @@ type ControlHostInfo struct {
 	CurrentRemote          netip.AddrPort   `json:"currentRemote"`
 	CurrentRelaysToMe      []netip.Addr     `json:"currentRelaysToMe"`
 	CurrentRelaysThroughMe []netip.Addr     `json:"currentRelaysThroughMe"`
+	// ForwardingFor lists the peers whose traffic this host actually forwards
+	// for this peer, which is not the same as CurrentRelaysThroughMe: that one
+	// also counts relays where we are the far end rather than the carrier.
+	ForwardingFor []netip.Addr `json:"forwardingFor"`
 	// PinnedRelay is the relay timers.path_probe_interval measured as fastest
 	// and put this peer's traffic on. It is empty when traffic follows the
 	// ordinary rules, which is also the case when path probing is off.
@@ -107,6 +112,9 @@ func (c *Control) Start() error {
 	}
 	if c.statsStart != nil {
 		go c.statsStart()
+	}
+	if c.statusStart != nil {
+		go c.statusStart()
 	}
 	if c.dnsStart != nil {
 		go c.dnsStart()
@@ -390,6 +398,7 @@ func copyHostInfo(h *HostInfo, preferredRanges []netip.Prefix) ControlHostInfo {
 		RemoteAddrs:            h.remotes.CopyAddrs(preferredRanges),
 		CurrentRelaysToMe:      h.relayState.CopyRelayIps(),
 		CurrentRelaysThroughMe: h.relayState.CopyRelayForIps(),
+		ForwardingFor:          h.relayState.CopyForwardingPeers(),
 		CurrentRemote:          h.GetRemote(),
 		PinnedRelay:            h.PinnedRelay(),
 	}

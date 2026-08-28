@@ -427,6 +427,21 @@ tun:
   #use_system_route_table_buffer_size: 0
 
 # Configure logging level
+# Serve this node's tunnel state over HTTP. Shows which peers are up, which path
+# each one is using, which relay its traffic is pinned to, and which peers are
+# being forwarded through this node. Without it the only way to tell how a
+# tunnel is routed is to read the log and guess.
+#
+#   GET /status        a human readable page
+#   GET /status.json   the same report as JSON
+#   GET /              redirects to /status
+#
+# Bind it where it cannot be reached from outside: the report lists neighbours,
+# their remotes and the paths in use. Loopback is the safe default; an address
+# on the overlay itself works too if you want to read it from another node.
+#status:
+  #listen: 127.0.0.1:4280
+
 logging:
   # trace, debug, info, warn, or error. Default is info and is reloadable.
   # fatal and panic are accepted for backwards compatibility and map to error.

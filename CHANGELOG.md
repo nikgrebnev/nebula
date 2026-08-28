@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fastest as equally good and shares those out by a stable per-pair hash, so
   one relay does not end up carrying most of the mesh. Defaults to 0, which
   keeps pinning the single fastest path.
+- `status.listen` serves this node's tunnel state over HTTP: which peers are
+  up, which path each one is using, which relay its traffic is pinned to, and
+  which peers are forwarded through this node. `GET /status` for a page,
+  `GET /status.json` for the same report as JSON. Off unless configured.
 
 ### Added
 

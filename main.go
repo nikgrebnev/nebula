@@ -332,7 +332,7 @@ func Main(c *config.C, configTest bool, buildVersion string, l *slog.Logger, dev
 
 	networkChanges := udp.NewNetworkChangeMonitor(ctx, l, c)
 
-	return &Control{
+	ctrl := &Control{
 		state:                  StateReady,
 		f:                      ifce,
 		l:                      l,
@@ -344,7 +344,17 @@ func Main(c *config.C, configTest bool, buildVersion string, l *slog.Logger, dev
 		lighthouseStart:        lightHouse.StartUpdateWorker,
 		networkChangeStart:     networkChanges.Start,
 		connectionManagerStart: connManager.Start,
-	}, nil
+	}
+
+	// The status endpoint needs the Control it reports on, so it is built after
+	// it rather than beside the stats server.
+	status, err := newStatusServerFromConfig(ctx, l, c, ctrl, buildVersion)
+	if err != nil {
+		return nil, util.ContextualizeIfNeeded("Failed to start status listener", err)
+	}
+	ctrl.statusStart = status.Start
+
+	return ctrl, nil
 }
 
 // parseCpuAffinity reads `tun.cpu_affinity` from the config — a list of

@@ -154,6 +154,24 @@ func (rs *RelayState) CopyRelayIps() []netip.Addr {
 	return ret
 }
 
+// CopyForwardingPeers lists only the peers this host actually FORWARDS for.
+// CopyRelayForIps below mixes two different things: relays where we forward
+// somebody else's traffic (ForwardingType) and relays where we are the far end
+// (TerminalType). Counting the mix as "traffic I carry" credits a node that
+// merely uses a relay with carrying it, which is how a node with
+// am_relay: false ended up reported as carrying 64 pairs.
+func (rs *RelayState) CopyForwardingPeers() []netip.Addr {
+	rs.RLock()
+	defer rs.RUnlock()
+	out := make([]netip.Addr, 0, len(rs.relayForByAddr))
+	for addr, r := range rs.relayForByAddr {
+		if r.Type == ForwardingType {
+			out = append(out, addr)
+		}
+	}
+	return out
+}
+
 func (rs *RelayState) CopyRelayForIps() []netip.Addr {
 	rs.RLock()
 	defer rs.RUnlock()
