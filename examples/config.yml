@@ -248,10 +248,31 @@ relay:
     #- 192.168.100.1
     #- <other Nebula VPN IPs of hosts used as relays to access me>
   # Set am_relay to true to permit other hosts to list my IP in their relays config. Default false.
+  # A relay may still use relays of its own: forwarding for others and being
+  # forwarded are independent. Chains cannot form regardless, because a relay
+  # only forwards to peers it holds a direct tunnel with.
   am_relay: false
   # Set use_relays to false to prevent this instance from attempting to establish connections through relays.
   # default true
   use_relays: true
+
+# Timers that govern how tunnels are maintained.
+#timers:
+  # How often to check that a tunnel is still alive, in seconds. Default 5.
+  #connection_alive_interval: 5
+  # How long to wait before deleting a tunnel that stopped answering, in seconds. Default 10.
+  #pending_deletion_interval: 10
+  # How often an established tunnel should run the handshake again so a better
+  # path can win. Nebula picks a remote once, during the handshake, and never
+  # revisits that choice: a tunnel that fell back to a relay stays on the relay
+  # long after the direct path recovered, and from the outside it still looks
+  # healthy. The handshake fans out to every known remote and the first reply
+  # wins, so simply repeating it re-runs the selection.
+  # Only the lower addressed side of a pair drives this, and only for tunnels
+  # carrying traffic. Unset (0, the default) keeps the old behaviour.
+  # Keep it generous - minutes, not seconds. A short interval re-keys tunnels
+  # constantly and costs far more than the crooked path it is meant to fix.
+  #rehandshake_interval: 30m
 
 # Configure the private interface. Note: addr is baked into the nebula certificate
 tun:

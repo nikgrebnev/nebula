@@ -1,6 +1,7 @@
 package nebula
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"net/netip"
@@ -574,4 +575,111 @@ func (d *dummyCert) MarshalJSON() ([]byte, error) {
 
 func (d *dummyCert) Copy() cert.Certificate {
 	return d
+}
+
+// Test_ConnectionManager_PathRecheck shows that timers.rehandshake_interval
+// makes an established tunnel run the handshake again on a schedule, and that
+// only one end of a pair drives it.
+//
+// Why this lives here and not in e2e: the e2e harness never ticks the
+// connection manager (no "Tunnel status" ever appears in its logs), so the
+// periodic decision cannot be observed there at all.
+func Test_ConnectionManager_PathRecheck(t *testing.T) {
+	l := test.NewLogger()
+	localrange := netip.MustParsePrefix("10.1.1.1/24")
+	preferredRanges := []netip.Prefix{localrange}
+
+	hostMap := newHostMap(l)
+	hostMap.preferredRanges.Store(&preferredRanges)
+
+	cs := &CertState{
+		initiatingVersion: cert.Version1,
+		privateKey:        []byte{},
+		v1Cert:            &dummyCert{version: cert.Version1},
+		v1Credential:      nil,
+	}
+
+	lh := newTestLighthouse()
+	ifce := &Interface{
+		hostMap:          hostMap,
+		inside:           &overlaytest.NoopTun{},
+		outside:          &udp.NoopConn{},
+		firewall:         &Firewall{},
+		lightHouse:       lh,
+		pki:              &PKI{},
+		handshakeManager: NewHandshakeManager(l, hostMap, lh, &udp.NoopConn{}, defaultHandshakeConfig),
+		l:                l,
+	}
+	ifce.pki.cs.Store(cs)
+	ifce.myVpnAddrs = []netip.Addr{netip.MustParseAddr("172.1.1.1")}
+
+	conf := config.NewC(l)
+	punchy := NewPunchyFromConfig(l, conf, nil)
+	nc := newConnectionManagerFromConfig(l, conf, hostMap, punchy)
+	nc.intf = ifce
+	nc.pathRecheckInterval.Store(int64(time.Minute))
+
+	newPeer := func(addr string, stampAge time.Duration) *HostInfo {
+		vpnIp := netip.MustParseAddr(addr)
+		hi := &HostInfo{
+			vpnAddrs:        []netip.Addr{vpnIp},
+			ConnectionState: &ConnectionState{myCert: &dummyCert{version: cert.Version1}},
+		}
+		hi.pathCheckedAt = time.Now().Add(-stampAge)
+		return hi
+	}
+
+	pending := func() int {
+		n := 0
+		nc.intf.handshakeManager.ForEachVpnAddr(func(_ *HostInfo) { n++ })
+		return n
+	}
+
+	// A tunnel younger than the interval is left alone.
+	nc.tryRehandshake(newPeer("172.1.1.9", time.Second))
+	assert.Equal(t, 0, pending(), "a fresh tunnel must not be re-handshaked")
+
+	// A peer whose vpn addr is below ours is driven by the peer, not by us.
+	nc.tryRehandshake(newPeer("172.1.1.0", time.Hour))
+	assert.Equal(t, 0, pending(), "the lower addressed side drives, we must stay quiet")
+
+	// An older tunnel to a higher addressed peer is ours to recheck.
+	nc.tryRehandshake(newPeer("172.1.1.9", time.Hour))
+	assert.Equal(t, 1, pending(), "an aged tunnel must be re-handshaked")
+
+	// Turning the feature off stops it.
+	nc.pathRecheckInterval.Store(0)
+	nc.tryRehandshake(newPeer("172.1.1.8", time.Hour))
+	assert.Equal(t, 1, pending(), "with the interval unset nothing new should start")
+}
+
+// Test_ConnectionManager_RehandshakeIntervalMustBeADuration guards the trap this
+// key sits in. Every other setting in the timers block is a plain number of
+// seconds, so a bare number is what an operator writes here by hand - and it is
+// not a duration, so it parses as nothing and leaves the feature off while the
+// config reads as if it were on. Being told beats finding out later.
+func Test_ConnectionManager_RehandshakeIntervalMustBeADuration(t *testing.T) {
+	var logged bytes.Buffer
+	l := test.NewLoggerWithOutput(&logged)
+
+	conf := config.NewC(l)
+	conf.Settings["timers"] = map[string]any{"rehandshake_interval": 30}
+
+	hostMap := newHostMap(l)
+	punchy := NewPunchyFromConfig(l, conf, nil)
+	nc := newConnectionManagerFromConfig(l, conf, hostMap, punchy)
+
+	assert.Zero(t, nc.pathRecheckInterval.Load(),
+		"a value that is not a duration cannot switch the feature on")
+	assert.Contains(t, logged.String(), "timers.rehandshake_interval is not a duration",
+		"a value that was thrown away has to be named, or the config reads as configured")
+
+	// A real duration still works, and says nothing.
+	logged.Reset()
+	conf2 := config.NewC(l)
+	conf2.Settings["timers"] = map[string]any{"rehandshake_interval": "30m"}
+	nc2 := newConnectionManagerFromConfig(l, conf2, newHostMap(l),
+		NewPunchyFromConfig(l, conf2, nil))
+	assert.Equal(t, int64(30*time.Minute), nc2.pathRecheckInterval.Load())
+	assert.NotContains(t, logged.String(), "is not a duration")
 }
