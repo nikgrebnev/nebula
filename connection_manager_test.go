@@ -683,3 +683,53 @@ func Test_ConnectionManager_RehandshakeIntervalMustBeADuration(t *testing.T) {
 	assert.Equal(t, int64(30*time.Minute), nc2.pathRecheckInterval.Load())
 	assert.NotContains(t, logged.String(), "is not a duration")
 }
+
+// Only the spread changes here, and it has to take effect. The store used to
+// sit inside the block guarded by the two probe timers, so a reload that
+// touched nothing else read the new value and dropped it on the floor without
+// a word in the log.
+func TestConnectionManagerReloadsPathProbeSpread(t *testing.T) {
+	var logs bytes.Buffer
+	c := config.NewC(test.NewLogger())
+	require.NoError(t, c.LoadString(`
+timers:
+  path_probe_interval: 5s
+  path_probe_spread: 10
+`))
+	nc := newConnectionManagerFromConfig(test.NewLoggerWithOutput(&logs), c, nil, nil)
+	require.Equal(t, int64(10), nc.pathProbeSpread.Load())
+
+	require.NoError(t, c.ReloadConfigString(`
+timers:
+  path_probe_interval: 5s
+  path_probe_spread: 20
+`))
+	assert.Equal(t, int64(20), nc.pathProbeSpread.Load(), "a reloaded spread must be picked up")
+	assert.Contains(t, logs.String(), "Path probe spread has changed", "and the change has to be visible in the log")
+}
+
+// A spread large enough to take in every path switches probing off without
+// saying so, so it has to be brought back to the limit. Nebula clamps an out
+// of range number and warns rather than refusing to start, the way listen.batch
+// and routines do, so a bad number costs a log line and not the tunnels.
+func TestConnectionManagerLimitsPathProbeSpread(t *testing.T) {
+	var logs bytes.Buffer
+	c := config.NewC(test.NewLogger())
+	require.NoError(t, c.LoadString(`
+timers:
+  path_probe_interval: 5s
+  path_probe_spread: 900
+`))
+	nc := newConnectionManagerFromConfig(test.NewLoggerWithOutput(&logs), c, nil, nil)
+
+	assert.Less(t, nc.pathProbeSpread.Load(), int64(900), "an out of range spread must be brought to the limit, not kept")
+	assert.Contains(t, logs.String(), "timers.path_probe_spread", "and the operator has to be told")
+
+	// At 900 the cutoff is ten times the fastest path, and a direct path wins a
+	// tie, so a direct path nine times slower than the relay beside it used to
+	// be pinned. That is the whole measurement thrown away in silence.
+	legs := []probeLeg{leg("10.0.0.1", 10), leg("", 90)}
+	got, ok := chooseLeg(legs, nc.pathProbeSpread.Load(), 1)
+	require.True(t, ok)
+	assert.Equal(t, netip.MustParseAddr("10.0.0.1"), got.relay, "a path nine times slower is not an equal")
+}

@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A relay may now use relays of its own. Forwarding for others and being
   forwarded are independent, and tying them together left a relay walking a
   bad direct route instead of a short relayed one. Chains still cannot form.
+- `timers.path_probe_spread` treats any path within that percentage of the
+  fastest as equally good and shares those out by a stable per-pair hash, so
+  one relay does not end up carrying most of the mesh. Defaults to 0, which
+  keeps pinning the single fastest path, and is accepted up to 50: a larger
+  spread would call every path equal and is brought back to the limit.
+
 - `timers.rehandshake_interval` makes an established tunnel run the handshake
   again on a schedule, so a better path can win. Nebula picks a remote once,
   during the handshake, and never revisits that choice: a tunnel that fell back
