@@ -158,7 +158,10 @@ func (f *Interface) readOutsidePackets(via ViaSender, packet []byte, rxc *rxCont
 	case header.Test:
 		switch h.Subtype {
 		case header.TestReply:
-			// No-op, useful for the Roaming and connectionManager side-effects above
+			// No-op beyond the Roaming and connectionManager side-effects above,
+			// except that a path probe gets its payload echoed back here and that
+			// is how a leg's round trip time is learned.
+			hostinfo.notePathProbeReply(out, time.Now())
 		case header.TestRequest:
 			const maxCipherOverhead = 16 //todo we use this too often, needs a real importable const
 			const maxOverhead = header.Len + header.Len + maxCipherOverhead + maxCipherOverhead

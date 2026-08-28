@@ -154,6 +154,85 @@ func (f *Interface) sendInsideEncrypt(hostinfo *HostInfo, ci *ConnectionState, s
 // kernel-supplied superpacket bytes never get written into a separate
 // scratch arena: SegmentSuperpacket builds each segment's plaintext in
 // segScratch[:segLen] in turn, and we encrypt directly into a fresh SendBatch slot.
+// resolveRelay picks the relay to send this peer's traffic through.
+//
+// want names a specific relay; the zero value means any usable one. It returns
+// nil when nothing usable was found, and a relay we can no longer resolve is
+// dropped from the peer on the way past.
+//
+// Both send paths go through this, and they have to: the batched data path and
+// sendNoMetrics used to decide separately, and a preference the data path
+// ignores is not a preference. That cost a wrong measurement once already.
+func (f *Interface) resolveRelay(hostinfo *HostInfo, want netip.Addr) (*HostInfo, *Relay) {
+	if want.IsValid() {
+		// A named relay is resolved without copying the relay list. This runs per
+		// packet for a peer with a pin, and CopyRelayIps allocates.
+		if !hostinfo.relayState.hasRelay(want) {
+			return nil, nil
+		}
+		relayHostInfo, relay, err := f.hostMap.QueryVpnAddrsRelayFor(hostinfo.vpnAddrs, want)
+		if err != nil {
+			hostinfo.relayState.DeleteRelay(want)
+			hostinfo.logger(f.l).Info("Failed to find a HostInfo for relay",
+				"relay", want,
+				"error", err,
+			)
+			return nil, nil
+		}
+		return relayHostInfo, relay
+	}
+
+	for _, relayIP := range hostinfo.relayState.CopyRelayIps() {
+		relayHostInfo, relay, err := f.hostMap.QueryVpnAddrsRelayFor(hostinfo.vpnAddrs, relayIP)
+		if err != nil {
+			hostinfo.relayState.DeleteRelay(relayIP)
+			hostinfo.logger(f.l).Info("Failed to find a HostInfo for relay",
+				"relay", relayIP,
+				"error", err,
+			)
+			continue
+		}
+		return relayHostInfo, relay
+	}
+	return nil, nil
+}
+
+// relayForSending decides whether this peer's traffic should be relayed at all,
+// and through which relay. A path preference measured by path probing wins over
+// a direct remote; without one the original rule stands, and a relay is used
+// only when there is no direct remote.
+func (f *Interface) relayForSending(hostinfo *HostInfo) (*HostInfo, *Relay) {
+	pin := hostinfo.PinnedRelay()
+	if !pin.IsValid() && hostinfo.GetRemote().IsValid() {
+		return nil, nil
+	}
+
+	if pin.IsValid() {
+		if relayHostInfo, relay := f.resolveRelay(hostinfo, pin); relayHostInfo != nil {
+			return relayHostInfo, relay
+		}
+
+		// The pinned relay is gone. A measured preference is not a requirement,
+		// so drop it and take whatever path is left rather than leaving this
+		// peer with none.
+		//
+		// Falling through matters more than it looks. Nothing else would clear
+		// this pin: it is cleared when a probe round is judged, and a round
+		// needs at least two paths to open. A relay-only peer that loses the
+		// relay it was pinned to is down to one candidate, so no round ever
+		// opens, and every packet keeps resolving to a relay that is not there.
+		// Service traffic hides it — that path drops the pin on its own and
+		// keeps answering, so the tunnel looks healthy from both ends while
+		// carrying no data at all.
+		hostinfo.pinRelay(netip.Addr{})
+		if hostinfo.GetRemote().IsValid() {
+			return nil, nil
+		}
+	}
+
+	return f.resolveRelay(hostinfo, netip.Addr{})
+}
+
 func (f *Interface) sendInsideMessage(hostinfo *HostInfo, pkt tio.Packet, nb []byte, sendBatch *batch.SendBatch) {
 	ci := hostinfo.ConnectionState
 	if ci.eKey == nil {
@@ -175,29 +254,14 @@ func (f *Interface) sendInsideMessage(hostinfo *HostInfo, pkt tio.Packet, nb []b
 	}
 
 	remote := hostinfo.GetRemote()
-	if !remote.IsValid() { //the relay path
-		//first, find our relay hostinfo:
-		var relayHostInfo *HostInfo
-		var relay *Relay
-		var err error
-		for _, relayIP := range hostinfo.relayState.CopyRelayIps() {
-			relayHostInfo, relay, err = f.hostMap.QueryVpnAddrsRelayFor(hostinfo.vpnAddrs, relayIP)
-			if err != nil {
-				hostinfo.relayState.DeleteRelay(relayIP)
-				hostinfo.logger(f.l).Info("sendNoMetrics failed to find HostInfo",
-					"relay", relayIP,
-					"error", err,
-				)
-				continue
-			}
-			break
-		}
-		if relayHostInfo == nil || relay == nil {
-			//failure already logged
-			return
-		}
+	relayHostInfo, relay := f.relayForSending(hostinfo)
+	if relayHostInfo == nil && !remote.IsValid() {
+		// No direct remote and no usable relay: this peer has no path at all.
+		return
+	}
 
-		err = tio.SegmentSuperpacket(pkt, func(seg []byte) error {
+	if relayHostInfo != nil { //the relay path
+		err := tio.SegmentSuperpacket(pkt, func(seg []byte) error {
 			//relay header + header + plaintext + AEAD tag (16 bytes for both AES-GCM and ChaCha20-Poly1305) + relay tag
 			scratch := sendBatch.Reserve(header.Len + header.Len + len(seg) + 16 + 16)
 
@@ -522,10 +586,24 @@ func (f *Interface) SendVia(via *HostInfo, relay *Relay, ad, nb, out []byte, noc
 }
 
 func (f *Interface) sendNoMetrics(t header.MessageType, st header.MessageSubType, ci *ConnectionState, hostinfo *HostInfo, remote netip.AddrPort, p, nb, out []byte, q int) {
+	f.sendNoMetricsVia(t, st, ci, hostinfo, remote, hostinfo.PinnedRelay(), p, nb, out, q)
+}
+
+// sendNoMetricsVia is sendNoMetrics with the relay decided by the caller.
+// forceRelay names a relay to send through even when a direct remote exists;
+// the zero value keeps the usual rule of relaying only when there is no direct
+// remote at all. Path probing uses it to measure one named path, and a pin left
+// by a finished probe uses it to keep traffic on the path that measured best.
+func (f *Interface) sendNoMetricsVia(t header.MessageType, st header.MessageSubType, ci *ConnectionState, hostinfo *HostInfo, remote netip.AddrPort, forceRelay netip.Addr, p, nb, out []byte, q int) {
 	if ci.eKey == nil {
 		return
 	}
-	useRelay := !remote.IsValid() && !hostinfo.GetRemote().IsValid()
+	if forceRelay.IsValid() && !hostinfo.relayState.hasRelay(forceRelay) {
+		// The relay went away between the decision and the send. Fall back to
+		// the ordinary rules rather than dropping the packet.
+		forceRelay = netip.Addr{}
+	}
+	useRelay := !remote.IsValid() && (!hostinfo.GetRemote().IsValid() || forceRelay.IsValid())
 	fullOut := out
 
 	if useRelay {
@@ -587,7 +665,7 @@ func (f *Interface) sendNoMetrics(t header.MessageType, st header.MessageSubType
 				"udpAddr", remote,
 			)
 		}
-	} else if hr := hostinfo.GetRemote(); hr.IsValid() {
+	} else if hr := hostinfo.GetRemote(); hr.IsValid() && !forceRelay.IsValid() {
 		err = f.writers[q].WriteTo(out, hr)
 		if err != nil {
 			hostinfo.logger(f.l).Error("Failed to write outgoing packet",
@@ -597,18 +675,8 @@ func (f *Interface) sendNoMetrics(t header.MessageType, st header.MessageSubType
 		}
 	} else {
 		// Try to send via a relay
-		for _, relayIP := range hostinfo.relayState.CopyRelayIps() {
-			relayHostInfo, relay, err := f.hostMap.QueryVpnAddrsRelayFor(hostinfo.vpnAddrs, relayIP)
-			if err != nil {
-				hostinfo.relayState.DeleteRelay(relayIP)
-				hostinfo.logger(f.l).Info("sendNoMetrics failed to find HostInfo",
-					"relay", relayIP,
-					"error", err,
-				)
-				continue
-			}
+		if relayHostInfo, relay := f.resolveRelay(hostinfo, forceRelay); relayHostInfo != nil {
 			f.SendVia(relayHostInfo, relay, out, nb, fullOut[:header.Len+len(out)], true, q)
-			break
 		}
 	}
 }

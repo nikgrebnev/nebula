@@ -49,6 +49,18 @@ type connectionManager struct {
 	// handshake time is kept until the tunnel dies.
 	pathRecheckInterval atomic.Int64
 
+	// pathProbeInterval, when non-zero, measures every path to a peer — the
+	// direct remote and each relay — and pins the one that answers fastest.
+	// Zero (the default) keeps the existing behaviour: whatever the handshake
+	// race produced is used until the tunnel dies.
+	pathProbeInterval atomic.Int64
+	// pathProbeMargin is how much faster a relay must be before traffic is
+	// moved onto it, so a pair of near-equal paths is not swapped back and
+	// forth on measurement noise.
+	pathProbeMargin atomic.Int64
+	// probeRound numbers rounds so a late reply from a previous one is ignored.
+	probeRound atomic.Uint64
+
 	l *slog.Logger
 }
 
@@ -94,6 +106,24 @@ func (cm *connectionManager) reload(c *config.C, initial bool) {
 			cm.l.Info("Path recheck interval has changed",
 				"oldDuration", old,
 				"newDuration", time.Duration(cm.pathRecheckInterval.Load()),
+			)
+		}
+	}
+
+	if initial || c.HasChanged("timers.path_probe_interval") || c.HasChanged("timers.path_probe_margin") {
+		old := time.Duration(cm.pathProbeInterval.Load())
+		cm.pathProbeInterval.Store((int64)(c.GetDuration("timers.path_probe_interval", 0)))
+		cm.pathProbeMargin.Store((int64)(c.GetDuration("timers.path_probe_margin", 10*time.Millisecond)))
+		if initial {
+			cm.l.Info("Path probe configured",
+				"interval", time.Duration(cm.pathProbeInterval.Load()),
+				"margin", time.Duration(cm.pathProbeMargin.Load()),
+			)
+		} else {
+			cm.l.Info("Path probe interval has changed",
+				"oldDuration", old,
+				"newDuration", time.Duration(cm.pathProbeInterval.Load()),
+				"margin", time.Duration(cm.pathProbeMargin.Load()),
 			)
 		}
 	}
@@ -215,6 +245,16 @@ func (cm *connectionManager) doTrafficCheck(localIndex uint32, p, nb, out []byte
 
 	case sendTestPacket:
 		cm.intf.SendMessageToHostInfo(header.Test, header.TestRequest, hostinfo, p, nb, out)
+	}
+
+	// Probing is unilateral: it only decides which way we send. Both ends may
+	// run it, and on an asymmetric network they should — the fast direction is
+	// not always the same one.
+	switch decision {
+	case doNothing, sendTestPacket, tryRehandshake:
+		if hostinfo != nil {
+			cm.maybePathProbe(hostinfo, nb, out, now)
+		}
 	}
 
 	cm.resetRelayTrafficCheck(hostinfo)
@@ -500,6 +540,12 @@ func (cm *connectionManager) swapPrimary(current, primary *HostInfo) {
 	cm.hostMap.Lock()
 	// Make sure the primary is still the same after the write lock. This avoids a race with a rehandshake.
 	if cm.hostMap.Hosts[current.vpnAddrs[0]] == primary {
+		// The measured path preference belongs to the peer, so it follows the
+		// primary the same way relays do. The tunnel being promoted got the pin
+		// when it was built, but the old primary may have moved since; without
+		// this the promotion silently reverts that decision until the next
+		// round measures it again.
+		carryPathPreference(primary, current)
 		cm.hostMap.unlockedMakePrimary(current)
 	}
 	cm.hostMap.Unlock()
@@ -534,6 +580,251 @@ func (cm *connectionManager) isInvalidCertificate(now time.Time, hostinfo *HostI
 	} else {
 		//if we reach here, the cert is no longer valid, but we're configured to keep tunnels from now-invalid certs open
 		return false
+	}
+}
+
+// maybePathProbe judges a finished probe round, or opens a new one when the
+// interval has come round again.
+func (cm *connectionManager) maybePathProbe(hostinfo *HostInfo, nb, out []byte, now time.Time) {
+	interval := time.Duration(cm.pathProbeInterval.Load())
+	if interval <= 0 || hostinfo.ConnectionState == nil {
+		return
+	}
+
+	// A round in flight is judged before another is opened, so the two never
+	// overlap and a reply can always be attributed.
+	if p := hostinfo.takePathProbe(now); p != nil {
+		cm.judgePathProbe(hostinfo, p)
+		return
+	}
+
+	if !hostinfo.probeDue(now, interval) {
+		return
+	}
+
+	round := cm.probeRound.Add(1)
+	relays := cm.probeCandidates(hostinfo)
+	legs := hostinfo.startPathProbe(round, now, relays)
+	if len(legs) == 0 {
+		// Say why nothing was measured. Silence here is indistinguishable from
+		// a broken feature, which cost real time to work out once already.
+		cm.l.Debug("Path probe skipped",
+			"vpnAddrs", hostinfo.vpnAddrs,
+			"reason", "fewer than two paths to compare",
+			"haveDirectRemote", hostinfo.GetRemote().IsValid(),
+			"relays", relays,
+		)
+		return
+	}
+	cm.l.Debug("Path probe sent",
+		"vpnAddrs", hostinfo.vpnAddrs,
+		"round", round,
+		"legs", len(legs),
+	)
+	for i, l := range legs {
+		payload := pathProbePayload(round, i)
+		remote, via := netip.AddrPort{}, l.relay
+		if !l.relay.IsValid() {
+			// Naming the remote explicitly keeps this leg direct even when a pin
+			// from an earlier round is in force.
+			remote, via = hostinfo.GetRemote(), netip.Addr{}
+		}
+		cm.intf.sendNoMetricsVia(header.Test, header.TestRequest, hostinfo.ConnectionState,
+			hostinfo, remote, via, payload, nb, out, 0)
+	}
+}
+
+// probeCandidates lists the relays that could carry this peer's traffic right
+// now: the ones this tunnel already uses, plus every relay we are configured to
+// use that holds an established relay for this peer.
+//
+// The configured ones matter because relayState only remembers how the tunnel
+// came up. A tunnel that handshook directly carries an empty relay list even
+// when relays answered during that same handshake, so without this the
+// comparison would never have a second path to make.
+//
+// A relay that qualifies is recorded on the peer as well. That is true — the
+// peer is reachable through it — and it is what lets a pin take effect and a
+// failover find the relay later.
+func (cm *connectionManager) probeCandidates(hostinfo *HostInfo) []netip.Addr {
+	var out []netip.Addr
+	seen := make(map[netip.Addr]struct{})
+
+	add := func(r netip.Addr) {
+		if !r.IsValid() || r == hostinfo.vpnAddrs[0] {
+			return
+		}
+		if _, ok := seen[r]; ok {
+			return
+		}
+		seen[r] = struct{}{}
+		if _, _, err := cm.intf.hostMap.QueryVpnAddrsRelayFor(hostinfo.vpnAddrs, r); err != nil {
+			// No established relay for this peer through that host, so there is
+			// nothing to measure this round. Ask for one, so the path can be
+			// measured next time: without this a relay that drops out never
+			// comes back into the comparison and the best path is lost for good.
+			cm.askForRelay(hostinfo, r)
+			return
+		}
+		hostinfo.relayState.InsertRelayTo(r)
+		out = append(out, r)
+	}
+
+	for _, r := range hostinfo.relayState.CopyRelayIps() {
+		add(r)
+	}
+	if cm.intf.lightHouse != nil {
+		for _, r := range cm.intf.lightHouse.GetRelaysForMe() {
+			add(r)
+		}
+	}
+	return out
+}
+
+// askForRelay rebuilds a relay this peer used to be reachable through, so it can
+// be measured again. requestRelay decides what that means: a first request when
+// there is no relay state, or the same request sent again when an earlier one
+// went unanswered. Re-sending matters here - a lost request would otherwise
+// leave the relay Requested for good, and with probing alone nothing else would
+// ever ask again.
+func (cm *connectionManager) askForRelay(hostinfo *HostInfo, relay netip.Addr) {
+	if cm.intf.relayManager == nil || !cm.intf.relayManager.GetUseRelays() {
+		return
+	}
+	relayHostInfo := cm.intf.hostMap.QueryVpnAddr(relay)
+	if relayHostInfo == nil || !relayHostInfo.GetRemote().IsValid() {
+		// No tunnel to the relay itself; nothing to ask over.
+		return
+	}
+	cm.l.Debug("Path probe is rebuilding a relay so the path can be measured again",
+		"vpnAddrs", hostinfo.vpnAddrs,
+		"relay", relay,
+	)
+	cm.intf.relayManager.requestRelay(cm.intf, hostinfo.logger(cm.l), slog.LevelDebug,
+		relayHostInfo, hostinfo.vpnAddrs[0])
+}
+
+// judgePathProbe acts on a finished round and says in the log what it saw, so a
+// tunnel sitting on a slow path is visible there and not only in round trip
+// time.
+func (cm *connectionManager) judgePathProbe(hostinfo *HostInfo, p *pathProbeState) {
+	margin := time.Duration(cm.pathProbeMargin.Load())
+	pinned := hostinfo.PinnedRelay()
+
+	// File this round under each path and decide on what the paths USUALLY cost,
+	// not on this one sample. A single sample decides badly on an unstable link:
+	// overnight, four peers reached over a degraded uplink moved back and forth
+	// all night while peers over a healthy link never moved at all.
+	keep := map[netip.Addr]struct{}{}
+	for _, l := range p.legs {
+		keep[l.relay] = struct{}{}
+		if l.got {
+			hostinfo.notePathResult(l.relay, l.rtt)
+		}
+	}
+	hostinfo.forgetPaths(keep)
+
+	var best probeLeg
+	haveBest := false
+	for _, l := range p.legs {
+		// A path has to be alive NOW to be chosen. Looking back over rounds is
+		// what stops a single swing from moving traffic, but the remembered
+		// numbers must never resurrect a path that just went silent: seen in the
+		// field, a peer was moved onto a direct path that had not answered at
+		// all, because its median from earlier rounds still looked good.
+		if !l.got {
+			continue
+		}
+		typ, ok := hostinfo.pathTypical(l.relay)
+		if !ok {
+			continue
+		}
+		if !haveBest || typ < best.rtt {
+			best = probeLeg{relay: l.relay, rtt: typ, got: true}
+			haveBest = true
+		}
+	}
+
+	if !haveBest {
+		// Silence is not evidence that the path in use is bad, so nothing moves.
+		cm.l.Info("Path probe got no replies",
+			"vpnAddrs", hostinfo.vpnAddrs,
+			"paths", p.describe(),
+		)
+		return
+	}
+
+	// Compare against the path actually in use, not against the direct one. A
+	// margin that only guards direct-against-relay leaves relay-against-relay
+	// unguarded, and two relays within noise of each other then swap every
+	// round. Measured: one peer went .1 -> .2 -> .1 in forty minutes because the
+	// two relays sat 10ms apart, exactly the margin.
+	// The path in use is judged on this round for silence — a path that just
+	// went quiet must hand over now, not in three rounds — but on its typical
+	// cost when it is answering.
+	current, haveCurrent := p.leg(pinned)
+	if haveCurrent {
+		if typ, ok := hostinfo.pathTypical(pinned); ok {
+			current.rtt = typ
+		}
+	}
+	if haveCurrent && best.rtt+margin >= current.rtt {
+		cm.l.Debug("Path probe kept the same path",
+			"vpnAddrs", hostinfo.vpnAddrs,
+			"paths", p.describe(),
+			"pinnedRelay", pinned,
+			"margin", margin,
+		)
+		return
+	}
+
+	want := best.relay
+	if want == pinned {
+		cm.l.Debug("Path probe kept the same path",
+			"vpnAddrs", hostinfo.vpnAddrs,
+			"paths", p.describe(),
+			"pinnedRelay", pinned,
+		)
+		return
+	}
+
+	// Three different things can move a tunnel, and flattening them into one
+	// line makes the log useless for telling a healthy network from a sick one.
+	reason := "faster by more than the margin"
+	if !haveCurrent {
+		switch {
+		case !pinned.IsValid():
+			// First decision for this peer. Not a failover.
+			reason = "no path was in use"
+		case p.carries(pinned):
+			// The path was measured this round and did not answer.
+			reason = "path in use stopped answering"
+		default:
+			// The path was not even a candidate any more: the relay tunnel it
+			// rode on is gone. Seen in the field the moment a relay was cut, and
+			// calling it "no path was in use" was plainly wrong - there was one.
+			reason = "path in use is gone"
+		}
+	}
+
+	hostinfo.pinRelay(want)
+	if want.IsValid() {
+		cm.l.Info("Path probe pinned a faster relay",
+			"vpnAddrs", hostinfo.vpnAddrs,
+			"relay", want,
+			"wasPinned", pinned,
+			"reason", reason,
+			"paths", p.describe(),
+			"margin", margin,
+		)
+	} else {
+		cm.l.Info("Path probe released the pinned relay",
+			"vpnAddrs", hostinfo.vpnAddrs,
+			"wasPinned", pinned,
+			"reason", reason,
+			"paths", p.describe(),
+			"margin", margin,
+		)
 	}
 }
 
@@ -623,7 +914,11 @@ func (cm *connectionManager) tryRehandshake(hostinfo *HostInfo) {
 			// compared against it. A valid remote means the data plane is going
 			// direct even if the last handshake arrived through a relay.
 			var from string
-			if r := hostinfo.remote.Load(); r != nil && r.IsValid() {
+			if pin := hostinfo.PinnedRelay(); pin.IsValid() && hostinfo.relayState.hasRelay(pin) {
+				// Path probing put traffic on this relay, so that is the path in
+				// use whatever hostinfo.remote says.
+				from = "relay via " + pin.String()
+			} else if r := hostinfo.remote.Load(); r != nil && r.IsValid() {
 				from = "direct " + r.String()
 			} else if relays := hostinfo.relayState.CopyRelayIps(); len(relays) > 0 {
 				// A relayed tunnel carries no remote of its own; name the relay

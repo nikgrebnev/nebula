@@ -274,6 +274,39 @@ relay:
   # constantly and costs far more than the crooked path it is meant to fix.
   #rehandshake_interval: 30m
 
+  # Measure every path to a peer - the direct remote and each relay that can
+  # carry its traffic - and send over whichever answers fastest.
+  #
+  # This exists because the path chosen at handshake time is not chosen on
+  # merit. The handshake goes out to every known remote at once and the first
+  # reply wins, but a relayed handshake has to build the relay first
+  # (CreateRelayRequest, CreateRelayResponse) and so starts a full round trip
+  # behind. The direct path therefore wins even when it is much slower, and
+  # nothing ever revisits that.
+  #
+  # A probe is an ordinary test packet whose payload comes back echoed, so the
+  # reply can be attributed to the path it was sent over. The reply returns the
+  # way the peer chooses, not the way it was sent, so each measurement is
+  # (our path out) + (their path back); the return leg is common to every path
+  # in a round, so the comparison between them still holds.
+  #
+  # Unset (0, the default) keeps the old behaviour. Both ends may run this: it
+  # only decides which way this side sends, and on an asymmetric network the
+  # fast direction is not always the same one.
+  #
+  # A relay is only a candidate while an established relay tunnel to the peer
+  # exists, so a relay that drops out would leave the comparison for good and
+  # take the best path with it. Probing therefore asks for a relay it no longer
+  # has, once, and measures it on the next round. Measured: with the relay cut
+  # every peer moved to the next one in a single round and connectivity held;
+  # restoring the relay brought it back into the comparison with no rehandshake
+  # involved.
+  #path_probe_interval: 2m
+
+  # How much faster a relay has to be before traffic moves onto it. Without a
+  # margin two near-equal paths swap back and forth on measurement noise.
+  #path_probe_margin: 10ms
+
 # Configure the private interface. Note: addr is baked into the nebula certificate
 tun:
   # When tun is disabled, a lighthouse can be started without a local tun interface (and therefore without root)

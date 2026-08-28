@@ -66,6 +66,88 @@ func (rm *relayManager) GetUseRelays() bool {
 // For each candidate relay it either kicks off a handshake to the relay, sends a CreateRelayRequest, retransmits
 // one that may have been lost, or, once the relay is Established, forwards the in-progress
 // stage 0 handshake packet for vpnIp through it.
+// requestRelay asks relayHostInfo to start relaying for peerAddr. It is the
+// relay-building half of StartRelays with the handshake parts left out, so a
+// caller that already has an established tunnel can rebuild a relay that went
+// away.
+//
+// It exists because path probing can otherwise lose a path for good: a relay is
+// only a candidate while an established relay for the peer exists, and until
+// this was factored out only a handshake ever built one. Cut a relay and it left
+// the candidate list; bring it back and nothing noticed until the next
+// rehandshake, which on a long interval is a long time to sit on a worse path.
+func (rm *relayManager) requestRelay(f *Interface, hl *slog.Logger, level slog.Level, relayHostInfo *HostInfo, peerAddr netip.Addr) {
+	vpnIp := peerAddr
+	relay := relayHostInfo.vpnAddrs[0]
+
+	var idx uint32
+	if existing, ok := relayHostInfo.relayState.QueryRelayForByIp(vpnIp); ok {
+		if existing.State == Established {
+			return
+		}
+		if existing.State == Disestablished {
+			relayHostInfo.relayState.UpdateRelayForByIpState(vpnIp, Requested)
+		}
+		// Send the same request again, with the index the peer was already
+		// handed. A CreateRelayRequest can be lost, and without a re-send the
+		// relay stays Requested for good - which, for a caller that is not a
+		// handshake, means the path never comes back.
+		idx = existing.LocalIndex
+		hl.Log(context.Background(), level, "Re-send CreateRelay request", "relay", relay.String())
+	} else {
+		var err error
+		idx, err = AddRelay(rm.l, relayHostInfo, rm.hostmap, vpnIp, nil, TerminalType, Requested)
+		if err != nil {
+			// No local relay state was installed, so a CreateRelayRequest would hand the
+			// peer an index we could never resolve. Skip it.
+			hl.Info("Failed to add relay to hostmap", "relay", relay.String(), "error", err)
+			return
+		}
+	}
+
+	m := NebulaControl{
+		Type:                NebulaControl_CreateRelayRequest,
+		InitiatorRelayIndex: idx,
+	}
+
+	switch relayHostInfo.GetCert().Certificate.Version() {
+	case cert.Version1:
+		if !f.myVpnAddrs[0].Is4() {
+			hl.Error("can not establish v1 relay with a v6 network because the relay is not running a current nebula version")
+			return
+		}
+
+		if !vpnIp.Is4() {
+			hl.Error("can not establish v1 relay with a v6 remote network because the relay is not running a current nebula version")
+			return
+		}
+
+		b := f.myVpnAddrs[0].As4()
+		m.OldRelayFromAddr = binary.BigEndian.Uint32(b[:])
+		b = vpnIp.As4()
+		m.OldRelayToAddr = binary.BigEndian.Uint32(b[:])
+	case cert.Version2:
+		m.RelayFromAddr = netAddrToProtoAddr(f.myVpnAddrs[0])
+		m.RelayToAddr = netAddrToProtoAddr(vpnIp)
+	default:
+		hl.Error("Unknown certificate version found while creating relay")
+		return
+	}
+
+	msg, err := m.Marshal()
+	if err != nil {
+		hl.Error("Failed to marshal Control message to create relay", "error", err)
+	} else {
+		f.SendMessageToHostInfo(header.Control, 0, relayHostInfo, msg, make([]byte, 12), make([]byte, mtu))
+		rm.l.Log(context.Background(), level, "send CreateRelayRequest",
+			"relayFrom", f.myVpnAddrs[0],
+			"relayTo", vpnIp,
+			"initiatorRelayIndex", idx,
+			"relay", relay,
+		)
+	}
+}
+
 func (rm *relayManager) StartRelays(f *Interface, vpnIp netip.Addr, hh *HandshakeHostInfo, stage0 []byte) {
 	hostinfo := hh.hostinfo
 	if !rm.GetUseRelays() || len(hostinfo.remotes.relays) == 0 {
@@ -113,55 +195,7 @@ func (rm *relayManager) StartRelays(f *Interface, vpnIp netip.Addr, hh *Handshak
 		if !ok {
 			// No relays exist or requested yet.
 			if relayHostInfo.GetRemote().IsValid() {
-				idx, err := AddRelay(rm.l, relayHostInfo, rm.hostmap, vpnIp, nil, TerminalType, Requested)
-				if err != nil {
-					// No local relay state was installed, so a CreateRelayRequest would hand the
-					// peer an index we could never resolve. Skip it.
-					hl.Info("Failed to add relay to hostmap", "relay", relay.String(), "error", err)
-					continue
-				}
-
-				m := NebulaControl{
-					Type:                NebulaControl_CreateRelayRequest,
-					InitiatorRelayIndex: idx,
-				}
-
-				switch relayHostInfo.GetCert().Certificate.Version() {
-				case cert.Version1:
-					if !f.myVpnAddrs[0].Is4() {
-						hl.Error("can not establish v1 relay with a v6 network because the relay is not running a current nebula version")
-						continue
-					}
-
-					if !vpnIp.Is4() {
-						hl.Error("can not establish v1 relay with a v6 remote network because the relay is not running a current nebula version")
-						continue
-					}
-
-					b := f.myVpnAddrs[0].As4()
-					m.OldRelayFromAddr = binary.BigEndian.Uint32(b[:])
-					b = vpnIp.As4()
-					m.OldRelayToAddr = binary.BigEndian.Uint32(b[:])
-				case cert.Version2:
-					m.RelayFromAddr = netAddrToProtoAddr(f.myVpnAddrs[0])
-					m.RelayToAddr = netAddrToProtoAddr(vpnIp)
-				default:
-					hl.Error("Unknown certificate version found while creating relay")
-					continue
-				}
-
-				msg, err := m.Marshal()
-				if err != nil {
-					hl.Error("Failed to marshal Control message to create relay", "error", err)
-				} else {
-					f.SendMessageToHostInfo(header.Control, 0, relayHostInfo, msg, make([]byte, 12), make([]byte, mtu))
-					rm.l.Log(context.Background(), level, "send CreateRelayRequest",
-						"relayFrom", f.myVpnAddrs[0],
-						"relayTo", vpnIp,
-						"initiatorRelayIndex", idx,
-						"relay", relay,
-					)
-				}
+				rm.requestRelay(f, hl, level, relayHostInfo, vpnIp)
 			}
 			continue
 		}
@@ -170,54 +204,11 @@ func (rm *relayManager) StartRelays(f *Interface, vpnIp netip.Addr, hh *Handshak
 		case Established:
 			hl.Log(context.Background(), level, "Send handshake via relay", "relay", relay.String())
 			f.SendVia(relayHostInfo, existingRelay, stage0, make([]byte, 12), make([]byte, mtu), false, 0)
-		case Disestablished:
-			// Mark this relay as 'requested'
-			relayHostInfo.relayState.UpdateRelayForByIpState(vpnIp, Requested)
-			fallthrough
-		case Requested:
-			hl.Log(context.Background(), level, "Re-send CreateRelay request", "relay", relay.String())
-			// Re-send the CreateRelay request, in case the previous one was lost.
-			m := NebulaControl{
-				Type:                NebulaControl_CreateRelayRequest,
-				InitiatorRelayIndex: existingRelay.LocalIndex,
-			}
-
-			switch relayHostInfo.GetCert().Certificate.Version() {
-			case cert.Version1:
-				if !f.myVpnAddrs[0].Is4() {
-					hl.Error("can not establish v1 relay with a v6 network because the relay is not running a current nebula version")
-					continue
-				}
-
-				if !vpnIp.Is4() {
-					hl.Error("can not establish v1 relay with a v6 remote network because the relay is not running a current nebula version")
-					continue
-				}
-
-				b := f.myVpnAddrs[0].As4()
-				m.OldRelayFromAddr = binary.BigEndian.Uint32(b[:])
-				b = vpnIp.As4()
-				m.OldRelayToAddr = binary.BigEndian.Uint32(b[:])
-			case cert.Version2:
-				m.RelayFromAddr = netAddrToProtoAddr(f.myVpnAddrs[0])
-				m.RelayToAddr = netAddrToProtoAddr(vpnIp)
-			default:
-				hl.Error("Unknown certificate version found while creating relay")
-				continue
-			}
-			msg, err := m.Marshal()
-			if err != nil {
-				hl.Error("Failed to marshal Control message to create relay", "error", err)
-			} else {
-				// This must send over the hostinfo, not over hm.Hosts[ip]
-				f.SendMessageToHostInfo(header.Control, 0, relayHostInfo, msg, make([]byte, 12), make([]byte, mtu))
-				rm.l.Log(context.Background(), level, "send CreateRelayRequest",
-					"relayFrom", f.myVpnAddrs[0],
-					"relayTo", vpnIp,
-					"initiatorRelayIndex", existingRelay.LocalIndex,
-					"relay", relay,
-				)
-			}
+		case Disestablished, Requested:
+			// Both cases are the same request going out again, and requestRelay
+			// does exactly that. A second copy of the certificate-version switch
+			// and message assembly is not worth keeping.
+			rm.requestRelay(f, hl, level, relayHostInfo, vpnIp)
 		case PeerRequested:
 			// PeerRequested only occurs in Forwarding relays, not Terminal relays, and this is a Terminal relay case.
 			fallthrough

@@ -484,6 +484,10 @@ func (hm *HandshakeManager) CheckAndComplete(hostinfo *HostInfo, handshakePacket
 	// peer opened out of the feature, silently and for good.
 	hostinfo.pathCheckedAt = time.Now()
 
+	// Same reason, same two paths: a measured path preference has to survive a
+	// handshake the peer started, not only one we started ourselves.
+	carryPathPreference(existingHostInfo, hostinfo)
+
 	hm.mainHostMap.unlockedAddHostInfo(hostinfo, f)
 	return existingHostInfo, nil
 }
@@ -505,6 +509,14 @@ func describePath(via ViaSender) string {
 // over. A valid remote means the data plane goes direct, whatever route the
 // handshake itself took to get here.
 func describeCarriedPath(hostinfo *HostInfo, via ViaSender) string {
+	// A measured path preference beats the direct remote in the send path, so it
+	// has to beat it here too. Saying "direct" while every packet goes through a
+	// relay is the exact mistake this function exists to avoid, and the pin is a
+	// second way to make it. The staleness check mirrors resolveRelay: a pin
+	// whose relay is gone is not the path traffic takes.
+	if pin := hostinfo.PinnedRelay(); pin.IsValid() && hostinfo.relayState.hasRelay(pin) {
+		return "relay via " + pin.String()
+	}
 	if r := hostinfo.remote.Load(); r != nil && r.IsValid() {
 		return "direct " + r.String()
 	}
@@ -541,6 +553,12 @@ func (hm *HandshakeManager) Complete(hostinfo *HostInfo, f *Interface) {
 		hostinfo.logger(hm.l).Info("New host shadows existing host remoteIndex",
 			"collision", existingRemoteIndex.vpnAddrs,
 		)
+	}
+
+	// Carry a measured path preference across the replacement, before the new
+	// hostinfo takes the old one's place.
+	if len(hostinfo.vpnAddrs) > 0 {
+		carryPathPreference(hm.mainHostMap.Hosts[hostinfo.vpnAddrs[0]], hostinfo)
 	}
 
 	// We need to remove from the pending hostmap first to avoid undoing work when after to the main hostmap.

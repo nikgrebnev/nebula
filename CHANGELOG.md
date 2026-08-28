@@ -21,6 +21,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only for tunnels carrying traffic. The log reports both the attempt and the
   path traffic actually takes afterwards.
 
+- `timers.path_probe_interval` measures every path to a peer - the direct
+  remote and each relay that can carry its traffic - and sends over whichever
+  answers fastest. The path picked at handshake time is not picked on merit: the
+  first reply wins, and a relayed handshake starts a full round trip behind
+  because it has to build the relay first, so the direct path wins even when it
+  is far slower. Unset (`0`) by default. `timers.path_probe_margin` (`10ms`)
+  is how much faster a path must be before traffic moves, so near-equal paths do
+  not swap back and forth on noise. A relay that dropped out is asked for again,
+  so a path that goes away can come back into the comparison instead of being
+  lost until the next handshake. Every decision is logged with what each path
+  cost and why it changed.
+
 - A relay may now use relays of its own. Setting `relay.am_relay` used to take
   the node's own relays away, forcing a choice between forwarding for others and
   being able to reach a peer through somebody else. Relay chains stay impossible
