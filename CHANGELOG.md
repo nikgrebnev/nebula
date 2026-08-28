@@ -12,6 +12,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A relay may now use relays of its own. Forwarding for others and being
   forwarded are independent, and tying them together left a relay walking a
   bad direct route instead of a short relayed one. Chains still cannot form.
+- `timers.rehandshake_interval` makes an established tunnel run the handshake
+  again on a schedule, so a better path can win. Nebula picks a remote once,
+  during the handshake, and never revisits that choice: a tunnel that fell back
+  to a relay stays on it long after the direct path recovered, and from the
+  outside it still looks healthy. Unset (`0`) by default, which keeps the
+  existing behaviour. Only the lower addressed side of a pair drives it, and
+  only for tunnels carrying traffic. The log reports both the attempt and the
+  path traffic actually takes afterwards.
+
+- A relay may now use relays of its own. Setting `relay.am_relay` used to take
+  the node's own relays away, forcing a choice between forwarding for others and
+  being able to reach a peer through somebody else. Relay chains stay impossible
+  regardless: a relay only forwards to peers it holds a direct tunnel with. Set
+  `relay.use_relays: false` to keep the old behaviour on a relay.
 
 ### Changed
 

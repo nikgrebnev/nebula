@@ -43,6 +43,11 @@ type connectionManager struct {
 	pendingDeletionInterval time.Duration
 	inactivityTimeout       atomic.Int64
 	dropInactive            atomic.Bool
+	// pathRecheckInterval, when non-zero, makes an established primary tunnel
+	// re-run the handshake on that schedule so a better remote can win again.
+	// Zero (the default) keeps the existing behaviour: the remote chosen at
+	// handshake time is kept until the tunnel dies.
+	pathRecheckInterval atomic.Int64
 
 	l *slog.Logger
 }
@@ -75,6 +80,22 @@ func (cm *connectionManager) reload(c *config.C, initial bool) {
 		minDuration := min(time.Millisecond*500, cm.checkInterval, cm.pendingDeletionInterval)
 		maxDuration := max(cm.checkInterval, cm.pendingDeletionInterval)
 		cm.trafficTimer = NewLockingTimerWheel[uint32](minDuration, maxDuration)
+	}
+
+	if initial || c.HasChanged("timers.rehandshake_interval") {
+		old := time.Duration(cm.pathRecheckInterval.Load())
+		cm.pathRecheckInterval.Store((int64)(c.GetDuration("timers.rehandshake_interval", 0)))
+		if initial {
+			cm.l.Info("Path recheck configured",
+				"interval", time.Duration(cm.pathRecheckInterval.Load()),
+			)
+		}
+		if !initial {
+			cm.l.Info("Path recheck interval has changed",
+				"oldDuration", old,
+				"newDuration", time.Duration(cm.pathRecheckInterval.Load()),
+			)
+		}
 	}
 
 	if initial || c.HasChanged("tunnels.inactivity_timeout") {
@@ -572,5 +593,55 @@ func (cm *connectionManager) tryRehandshake(hostinfo *HostInfo) {
 
 		cm.intf.handshakeManager.StartHandshake(hostinfo.vpnAddrs[0], nil)
 		return
+	}
+
+	// Periodic path recheck. Only one end of a pair drives it, chosen the same
+	// way shouldSwapPrimary breaks its tie: the node with the lower vpn addr.
+	// Otherwise both ends re-handshake into each other.
+	// The handshake fans out to every known remote and
+	// the first reply wins, so simply re-running it lets a better path take
+	// over. Without this the remote picked at handshake time is kept forever:
+	// a tunnel that fell back to a relay stays there long after the direct
+	// path came back, and from the outside it still looks "up".
+	if interval := time.Duration(cm.pathRecheckInterval.Load()); interval > 0 {
+		since := hostinfo.pathCheckedAt
+		// One clock reading decides the whole thing and is also what gets
+		// logged. Reading the clock again per branch lets a tunnel fall between
+		// two of them on the same pass, and reports an elapsed time that is not
+		// the one the decision was made on.
+		elapsed := time.Since(since)
+		switch {
+		case since.IsZero():
+			hostinfo.logger(cm.l).Debug("Path recheck skipped", "reason", "tunnel carries no establish stamp")
+		case elapsed < interval:
+			// not due yet, nothing to say
+		case cm.intf.myVpnAddrs[0].Compare(hostinfo.vpnAddrs[0]) >= 0:
+			hostinfo.logger(cm.l).Debug("Path recheck skipped", "reason", "peer drives this pair",
+				"elapsed", elapsed, "mine", cm.intf.myVpnAddrs[0], "peer", hostinfo.vpnAddrs[0])
+		default:
+			// Describe the path traffic takes now, so the outcome can be
+			// compared against it. A valid remote means the data plane is going
+			// direct even if the last handshake arrived through a relay.
+			var from string
+			if r := hostinfo.remote.Load(); r != nil && r.IsValid() {
+				from = "direct " + r.String()
+			} else if relays := hostinfo.relayState.CopyRelayIps(); len(relays) > 0 {
+				// A relayed tunnel carries no remote of its own; name the relay
+				// we are reaching this peer through. Same wording as the outcome
+				// uses, otherwise an unchanged path reads as a switch.
+				from = "relay via " + relays[0].String()
+			}
+
+			cm.l.Info("Re-handshaking with remote",
+				"vpnAddrs", hostinfo.vpnAddrs,
+				"reason", "periodic path recheck",
+				"interval", interval,
+				"currentPath", from,
+			)
+			cm.intf.handshakeManager.StartHandshake(hostinfo.vpnAddrs[0], func(hh *HandshakeHostInfo) {
+				hh.pathRecheck.Store(&from)
+			})
+			return
+		}
 	}
 }

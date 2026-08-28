@@ -274,6 +274,12 @@ type HostInfo struct {
 	lastRoam       time.Time
 	lastRoamRemote netip.AddrPort
 
+	// pathCheckedAt is when this tunnel was last (re)established. It is used by
+	// timers.rehandshake_interval to decide when to look for a better path.
+	// Nebula picks a remote once, during the handshake, and never revisits that
+	// choice; a tunnel that fell back to a relay stays on it even after the
+	// direct path recovers.
+	pathCheckedAt time.Time
 	// lastUsed tracks the last time ConnectionManager checked the tunnel and it was in use.
 	// This value will be behind against actual tunnel utilization in the hot path.
 	// This should only be used by the ConnectionManagers ticker routine.

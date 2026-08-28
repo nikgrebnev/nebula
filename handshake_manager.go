@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rcrowley/go-metrics"
@@ -85,6 +86,10 @@ type HandshakeHostInfo struct {
 	lastRemotes               []netip.AddrPort // Remotes that we sent to during the previous attempt
 	lastRelays                []netip.Addr     // Relays we attempted to use during the previous attempt
 	packetStore               []*cachedPacket  // A set of packets to be transmitted once the handshake completes
+
+	// pathRecheck carries the snapshot a periodic path recheck left behind, and
+	// stays nil for a handshake started for any other reason.
+	pathRecheck atomic.Pointer[string]
 
 	hostinfo *HostInfo
 	machine  *handshake.Machine // The handshake state machine, set during stage 0 (initiator) or beginHandshake (responder multi-message)
@@ -472,8 +477,44 @@ func (hm *HandshakeManager) CheckAndComplete(hostinfo *HostInfo, handshakePacket
 		)
 	}
 
+	// Stamp the tunnel here as well as in Complete. There are two ways a tunnel
+	// reaches the main hostmap - this one when the peer started the handshake,
+	// and Complete when we did - and a tunnel with no stamp is never considered
+	// for a path recheck at all. Stamping only one of them left every tunnel the
+	// peer opened out of the feature, silently and for good.
+	hostinfo.pathCheckedAt = time.Now()
+
 	hm.mainHostMap.unlockedAddHostInfo(hostinfo, f)
 	return existingHostInfo, nil
+}
+
+// describePath renders how a tunnel is carried, for the periodic path recheck
+// log. A relayed tunnel has no hostinfo.remote of its own, so a relay is named
+// by its vpn address: that is the one form both ends of the comparison share.
+func describePath(via ViaSender) string {
+	if via.IsRelayed {
+		if via.relayHI != nil && len(via.relayHI.vpnAddrs) > 0 {
+			return "relay via " + via.relayHI.vpnAddrs[0].String()
+		}
+		return "relay " + via.UdpAddr.String()
+	}
+	return "direct " + via.UdpAddr.String()
+}
+
+// describeCarriedPath renders the path the tunnel will actually carry traffic
+// over. A valid remote means the data plane goes direct, whatever route the
+// handshake itself took to get here.
+func describeCarriedPath(hostinfo *HostInfo, via ViaSender) string {
+	if r := hostinfo.remote.Load(); r != nil && r.IsValid() {
+		return "direct " + r.String()
+	}
+	if via.IsRelayed && via.relayHI != nil && len(via.relayHI.vpnAddrs) > 0 {
+		return "relay via " + via.relayHI.vpnAddrs[0].String()
+	}
+	if relays := hostinfo.relayState.CopyRelayIps(); len(relays) > 0 {
+		return "relay via " + relays[0].String()
+	}
+	return describePath(via)
 }
 
 // Complete is a simpler version of CheckAndComplete when we already know we
@@ -484,6 +525,14 @@ func (hm *HandshakeManager) Complete(hostinfo *HostInfo, f *Interface) {
 	defer hm.mainHostMap.Unlock()
 	hm.Lock()
 	defer hm.Unlock()
+
+	// Stamp every established tunnel, whatever path it took. Doing this only on
+	// the direct initiator path misses relayed tunnels: the relay fan-out can
+	// produce several hostinfos and the one that ends up primary is not
+	// necessarily the one that ran the initiator completion.
+	// Under the main hostmap lock, which is what the connection manager reads it
+	// under.
+	hostinfo.pathCheckedAt = time.Now()
 
 	existingRemoteIndex, found := hm.mainHostMap.RemoteIndexes[hostinfo.remoteIndexId]
 	if found && existingRemoteIndex != nil {
@@ -979,6 +1028,30 @@ func (hm *HandshakeManager) continueHandshake(via ViaSender, hh *HandshakeHostIn
 	hostinfo.buildNetworks(f.myVpnNetworksTable, remoteCert.Certificate)
 
 	hm.Complete(hostinfo, f)
+
+	// Report the outcome of a periodic path recheck so a stuck tunnel is
+	// visible in the log instead of only in the round trip time. A snapshot is
+	// left behind only by a recheck that could name the path it was leaving,
+	// and without that name there is nothing to compare the outcome against.
+	if was := hh.pathRecheck.Load(); was != nil && *was != "" {
+		// Report the path traffic will actually take, not the one the handshake
+		// arrived on. They differ: a handshake can come back through a relay
+		// while the data plane keeps using a direct remote, and saying
+		// "switched to a relay" when nothing moved is worse than saying nothing.
+		now := describeCarriedPath(hostinfo, via)
+		if now == *was {
+			f.l.Info("Path recheck kept the same path",
+				"vpnAddrs", vpnAddrs,
+				"path", now,
+			)
+		} else {
+			f.l.Info("Path recheck switched path",
+				"vpnAddrs", vpnAddrs,
+				"oldPath", *was,
+				"newPath", now,
+			)
+		}
+	}
 
 	if len(hh.packetStore) > 0 {
 		if f.l.Enabled(context.Background(), slog.LevelDebug) {

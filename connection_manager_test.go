@@ -575,3 +575,79 @@ func (d *dummyCert) MarshalJSON() ([]byte, error) {
 func (d *dummyCert) Copy() cert.Certificate {
 	return d
 }
+
+// Test_ConnectionManager_PathRecheck shows that timers.rehandshake_interval
+// makes an established tunnel run the handshake again on a schedule, and that
+// only one end of a pair drives it.
+//
+// Why this lives here and not in e2e: the e2e harness never ticks the
+// connection manager (no "Tunnel status" ever appears in its logs), so the
+// periodic decision cannot be observed there at all.
+func Test_ConnectionManager_PathRecheck(t *testing.T) {
+	l := test.NewLogger()
+	localrange := netip.MustParsePrefix("10.1.1.1/24")
+	preferredRanges := []netip.Prefix{localrange}
+
+	hostMap := newHostMap(l)
+	hostMap.preferredRanges.Store(&preferredRanges)
+
+	cs := &CertState{
+		initiatingVersion: cert.Version1,
+		privateKey:        []byte{},
+		v1Cert:            &dummyCert{version: cert.Version1},
+		v1Credential:      nil,
+	}
+
+	lh := newTestLighthouse()
+	ifce := &Interface{
+		hostMap:          hostMap,
+		inside:           &overlaytest.NoopTun{},
+		outside:          &udp.NoopConn{},
+		firewall:         &Firewall{},
+		lightHouse:       lh,
+		pki:              &PKI{},
+		handshakeManager: NewHandshakeManager(l, hostMap, lh, &udp.NoopConn{}, defaultHandshakeConfig),
+		l:                l,
+	}
+	ifce.pki.cs.Store(cs)
+	ifce.myVpnAddrs = []netip.Addr{netip.MustParseAddr("172.1.1.1")}
+
+	conf := config.NewC(l)
+	punchy := NewPunchyFromConfig(l, conf, nil)
+	nc := newConnectionManagerFromConfig(l, conf, hostMap, punchy)
+	nc.intf = ifce
+	nc.pathRecheckInterval.Store(int64(time.Minute))
+
+	newPeer := func(addr string, stampAge time.Duration) *HostInfo {
+		vpnIp := netip.MustParseAddr(addr)
+		hi := &HostInfo{
+			vpnAddrs:        []netip.Addr{vpnIp},
+			ConnectionState: &ConnectionState{myCert: &dummyCert{version: cert.Version1}},
+		}
+		hi.pathCheckedAt = time.Now().Add(-stampAge)
+		return hi
+	}
+
+	pending := func() int {
+		n := 0
+		nc.intf.handshakeManager.ForEachVpnAddr(func(_ *HostInfo) { n++ })
+		return n
+	}
+
+	// A tunnel younger than the interval is left alone.
+	nc.tryRehandshake(newPeer("172.1.1.9", time.Second))
+	assert.Equal(t, 0, pending(), "a fresh tunnel must not be re-handshaked")
+
+	// A peer whose vpn addr is below ours is driven by the peer, not by us.
+	nc.tryRehandshake(newPeer("172.1.1.0", time.Hour))
+	assert.Equal(t, 0, pending(), "the lower addressed side drives, we must stay quiet")
+
+	// An older tunnel to a higher addressed peer is ours to recheck.
+	nc.tryRehandshake(newPeer("172.1.1.9", time.Hour))
+	assert.Equal(t, 1, pending(), "an aged tunnel must be re-handshaked")
+
+	// Turning the feature off stops it.
+	nc.pathRecheckInterval.Store(0)
+	nc.tryRehandshake(newPeer("172.1.1.8", time.Hour))
+	assert.Equal(t, 1, pending(), "with the interval unset nothing new should start")
+}
