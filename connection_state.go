@@ -69,7 +69,7 @@ func newConnectionStateFromResult(r *handshake.Result) (*ConnectionState, error)
 	}
 	ci.messageCounter.Add(r.MessageIndex)
 	for i := uint64(1); i <= r.MessageIndex; i++ {
-		ci.window.Update(nil, i)
+		ci.window.Seed(i)
 	}
 	return ci, nil
 }

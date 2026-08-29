@@ -16,9 +16,13 @@ const bitsPerWord = 64
 // circular bitmap packed into uint64 words (8x denser than a []bool), so a
 // length-N window costs N/8 bytes. length must be a power of two.
 type Bits struct {
-	length             uint64
-	lengthMask         uint64
-	current            uint64
+	length     uint64
+	lengthMask uint64
+	current    uint64
+	// seen says whether this window has accepted anything yet. Until it has,
+	// current is a placeholder rather than a measurement, and the distance to
+	// an incoming counter says nothing about lost traffic.
+	seen               bool
 	bits               []uint64
 	lostCounter        metrics.Counter
 	dupeCounter        metrics.Counter
@@ -165,6 +169,18 @@ func (b *Bits) Check(l *slog.Logger, i uint64) bool {
 // startPos=1), and once b.current >= b.length the marker is no longer
 // consulted. The marker prevents a fictitious "lost" hit on the first real
 // counter.
+// Seed marks a counter as already accounted for without treating it as traffic
+// observed from the peer. It exists for the indices a handshake has already
+// spent: those are our own bookkeeping, and letting them stand in for a real
+// packet would make the first packet that follows look like a jump from
+// nowhere and be charged to loss.
+func (b *Bits) Seed(i uint64) {
+	b.set(i)
+	if i > b.current {
+		b.current = i
+	}
+}
+
 func (b *Bits) Update(l *slog.Logger, i uint64) bool {
 	// Fast path: i is the next expected counter. Split out so the function
 	// stays small and avoids paying for the slow paths' slog argument-build
@@ -180,6 +196,7 @@ func (b *Bits) Update(l *slog.Logger, i uint64) bool {
 		}
 		b.bits[word] = w | mask
 		b.current = i
+		b.seen = true
 		return true
 	}
 	return b.updateSlow(l, i)
@@ -215,14 +232,24 @@ func (b *Bits) updateSlow(l *slog.Logger, i uint64) bool {
 			b.clearRange(startPos, count)
 		}
 
-		// Anything past the new window can never be backfilled, so it's lost.
-		if i > b.current+b.length {
+		// Anything past the new window can never be backfilled, so it is lost.
+		//
+		// Except on the very first packet this window ever accepts. There
+		// current is still its initial zero, which is a placeholder and not
+		// something the peer told us, so the distance to the incoming counter
+		// is not evidence of anything. A peer that kept counting across our
+		// restart opens with a high counter, and charging that difference to
+		// loss buries the real signal: measured on a live mesh, one node with
+		// thirteen tunnels booked 1,146,827 losses in its first twenty seconds
+		// and then 250 over the following forty.
+		if b.seen && i > b.current+b.length {
 			lost += int64(i - b.current - b.length)
 		}
 		b.lostCounter.Inc(lost)
 
 		b.set(i)
 		b.current = i
+		b.seen = true
 		return true
 	}
 

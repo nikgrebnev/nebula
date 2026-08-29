@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The replay window no longer reports the first packet it accepts as lost
+  traffic. A peer that kept counting across a restart opens with a high
+  counter, which used to be charged to `network.packets.lost` in full.
 - The ICMPv6 type was read from the wrong byte when classifying IPv6 packets, so the echo identifier used
   for conntrack was never picked up. (#1840)
 

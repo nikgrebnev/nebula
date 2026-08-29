@@ -91,25 +91,25 @@ func TestBits(t *testing.T) {
 func TestBitsLargeJumps(t *testing.T) {
 	l := test.NewLogger()
 
-	// length=16. Update(55) from current=0:
-	//   warmup, per-bit loop sees no n>16 with unset bits (slot 0 was set by
-	//   NewBits and gets re-evaluated when n=16; n=16 is not strictly > 16),
-	//   so the loop contributes 0. The jump exceeds the window so we record
-	//   55 - 0 - 16 = 39 packets fell out the back.
+	// length=16. Update(55) from current=0 is the first packet this window has
+	// ever accepted, so current is still its initial zero: a placeholder, not
+	// something the peer told us. The distance to 55 is therefore not evidence
+	// of loss and nothing is recorded. It only sets where counting starts.
 	b := NewBits(16)
 	b.lostCounter.Clear()
 	assert.True(t, b.Update(l, 55))
-	assert.Equal(t, int64(39), b.lostCounter.Count())
+	assert.Equal(t, int64(0), b.lostCounter.Count())
 
-	// Update(100): clears 16 slots starting at slot 56%16=8. Only slot 7 (for
-	// packet 55) was set, so 16 - 1 = 15 evicted slots had unset bits.
-	// Plus 100 - 55 - 16 = 29 packets fell past the window. Total 44.
+	// Update(100): now the window has a real starting point. It clears 16 slots
+	// starting at slot 56%16=8. Only slot 7 (for packet 55) was set, so
+	// 16 - 1 = 15 evicted slots had unset bits. Plus 100 - 55 - 16 = 29 packets
+	// fell past the window. Total 44.
 	assert.True(t, b.Update(l, 100))
-	assert.Equal(t, int64(39+44), b.lostCounter.Count())
+	assert.Equal(t, int64(44), b.lostCounter.Count())
 
 	// Update(200): same shape: 16 - 1 = 15 evicted unset, plus 200 - 100 - 16 = 84 past window. Total 99.
 	assert.True(t, b.Update(l, 200))
-	assert.Equal(t, int64(39+44+99), b.lostCounter.Count())
+	assert.Equal(t, int64(44+99), b.lostCounter.Count())
 }
 
 func TestBitsDupeCounter(t *testing.T) {
@@ -160,8 +160,9 @@ func TestBitsOutOfWindowCounter(t *testing.T) {
 	assert.False(t, b.Update(l, 0))
 	assert.Equal(t, int64(1), b.outOfWindowCounter.Count())
 
-	// 4 from the Update(20) jump + 9 from 21..29.
-	assert.Equal(t, int64(13), b.lostCounter.Count())
+	// The Update(20) jump is this window's first packet, so it records nothing:
+	// only the 9 from 21..29 remain.
+	assert.Equal(t, int64(9), b.lostCounter.Count())
 	assert.Equal(t, int64(0), b.dupeCounter.Count())
 	assert.Equal(t, int64(1), b.outOfWindowCounter.Count())
 }
@@ -173,13 +174,13 @@ func TestBitsLostCounter(t *testing.T) {
 	b.dupeCounter.Clear()
 	b.outOfWindowCounter.Clear()
 
-	// Walk 20..29 like the original, just with a bigger window. Same
-	// reasoning as TestBitsOutOfWindowCounter: 4 past-window from Update(20),
-	// then 9 more from the unit advances.
+	// Walk 20..29 like the original, just with a bigger window. Same reasoning
+	// as TestBitsOutOfWindowCounter: Update(20) is this window's first packet
+	// and records nothing, then 9 more from the unit advances.
 	for n := uint64(20); n <= 29; n++ {
 		assert.True(t, b.Update(l, n))
 	}
-	assert.Equal(t, int64(13), b.lostCounter.Count())
+	assert.Equal(t, int64(9), b.lostCounter.Count())
 	assert.Equal(t, int64(0), b.dupeCounter.Count())
 	assert.Equal(t, int64(0), b.outOfWindowCounter.Count())
 
@@ -324,16 +325,18 @@ func TestBitsWarmupOvershoot(t *testing.T) {
 	// Warmup arm: counts slots in [1..16] where bit unset and n>length.
 	// Only n=16 was unset and >length: but slot 16%16=0 is the marker,
 	// so b.get(16) reads bits[0]=1 and skips. Result: 0 lost from the loop.
-	// Past-window: i - current - length = 20 - 0 - 16 = 4 lost.
+	// The past-window term does not apply either: this is the first packet the
+	// window accepts, so current is a placeholder and the overshoot is not
+	// evidence of loss. It only fixes where counting begins.
 	assert.True(t, b.Update(l, 20))
-	assert.Equal(t, int64(4), b.lostCounter.Count())
+	assert.Equal(t, int64(0), b.lostCounter.Count())
 	assert.Equal(t, uint64(20), b.current)
 
 	// Steady state now (current=20 >= length=16). Unit advance to 21
 	// stomps slot 21%16=5, which was cleared by the jump and not reset,
 	// so this is +1 lost.
 	assert.True(t, b.Update(l, 21))
-	assert.Equal(t, int64(5), b.lostCounter.Count())
+	assert.Equal(t, int64(1), b.lostCounter.Count())
 }
 
 // TestBitsCheckAcrossWarmupBoundary pins the underflow trick in Check's
@@ -435,4 +438,32 @@ func BenchmarkBitsUpdateLargeJumps(b *testing.B) {
 	for n := 0; n < b.N; n++ {
 		z.Update(l, uint64(n+1)*1000)
 	}
+}
+
+// Первый пакет на нетронутом окне задаёт начало отсчёта, а не тысячи потерь.
+// Именно это ломало показатель в бою: сосед, продолжавший считать через наш
+// перезапуск, открывает разговор большим номером.
+func TestBitsFirstPacketDoesNotInventLosses(t *testing.T) {
+	l := test.NewLogger()
+	b := NewBits(8192)
+	b.lostCounter.Clear()
+
+	assert.True(t, b.Update(l, 96000), "пакет обязан быть принят")
+	assert.Equal(t, int64(0), b.lostCounter.Count(),
+		"на нетронутом окне сравнивать не с чем")
+	assert.Equal(t, uint64(96000), b.current, "но начало отсчёта он задаёт")
+}
+
+// А дальше всё считается как прежде: правка меняет ровно один случай.
+func TestBitsCountsLossesAfterTheFirstPacket(t *testing.T) {
+	l := test.NewLogger()
+	b := NewBits(16)
+	b.lostCounter.Clear()
+
+	assert.True(t, b.Update(l, 1000))
+	assert.Equal(t, int64(0), b.lostCounter.Count())
+
+	// Прыжок на 100 вперёд: 16 вытесненных пустых слотов плюс 100-16=84 за окном.
+	assert.True(t, b.Update(l, 1100))
+	assert.Equal(t, int64(15+84), b.lostCounter.Count())
 }
