@@ -154,6 +154,31 @@ func (rs *RelayState) CopyRelayIps() []netip.Addr {
 	return ret
 }
 
+// CopyForwardingPeers lists only the peers this host is FORWARDING for right
+// now. CopyRelayForIps below mixes two different things: relays where we
+// forward somebody else's traffic (ForwardingType) and relays where we are the
+// far end (TerminalType). Counting the mix as "traffic I carry" credits a node
+// that merely uses a relay with carrying it, which is how a node with
+// am_relay: false ended up reported as carrying 64 pairs.
+//
+// The state matters as much as the type. Nothing is ever removed from
+// relayForByAddr: a relay that was asked for and never answered stays behind as
+// Requested, and one that went away with its tunnel is only marked
+// Disestablished. Neither carries a packet - handleOutsideRelayPacket forwards
+// through the target relay only while it is Established - so neither is
+// reported here.
+func (rs *RelayState) CopyForwardingPeers() []netip.Addr {
+	rs.RLock()
+	defer rs.RUnlock()
+	out := make([]netip.Addr, 0, len(rs.relayForByAddr))
+	for addr, r := range rs.relayForByAddr {
+		if r.Type == ForwardingType && r.State == Established {
+			out = append(out, addr)
+		}
+	}
+	return out
+}
+
 func (rs *RelayState) CopyRelayForIps() []netip.Addr {
 	rs.RLock()
 	defer rs.RUnlock()

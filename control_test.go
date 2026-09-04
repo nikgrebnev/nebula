@@ -102,10 +102,11 @@ func TestControl_GetHostInfoByVpnIp(t *testing.T) {
 		CurrentRemote:          remote1,
 		CurrentRelaysToMe:      []netip.Addr{},
 		CurrentRelaysThroughMe: []netip.Addr{},
+		ForwardingFor:          []netip.Addr{},
 	}
 
 	// Make sure we don't have any unexpected fields
-	assertFields(t, []string{"VpnAddrs", "LocalIndex", "RemoteIndex", "RemoteAddrs", "Cert", "MessageCounter", "CurrentRemote", "CurrentRelaysToMe", "CurrentRelaysThroughMe", "PinnedRelay"}, thi)
+	assertFields(t, []string{"VpnAddrs", "LocalIndex", "RemoteIndex", "RemoteAddrs", "Cert", "MessageCounter", "CurrentRemote", "CurrentRelaysToMe", "CurrentRelaysThroughMe", "ForwardingFor", "PinnedRelay"}, thi)
 	assert.Equal(t, &expectedInfo, thi)
 	test.AssertDeepCopyEqual(t, &expectedInfo, thi)
 

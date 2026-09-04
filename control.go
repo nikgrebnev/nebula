@@ -67,6 +67,12 @@ type ControlHostInfo struct {
 	CurrentRemote          netip.AddrPort   `json:"currentRemote"`
 	CurrentRelaysToMe      []netip.Addr     `json:"currentRelaysToMe"`
 	CurrentRelaysThroughMe []netip.Addr     `json:"currentRelaysThroughMe"`
+	// ForwardingFor lists the peers this node is carrying this peer's traffic
+	// to and from right now. CurrentRelaysThroughMe above is not that: it also
+	// counts relays where this node is the far end rather than the carrier,
+	// and relays that were only asked for or have since been torn down, since
+	// nothing is ever removed from the map behind it.
+	ForwardingFor []netip.Addr `json:"forwardingFor"`
 	// PinnedRelay is the relay timers.path_probe_interval measured as fastest
 	// and put this peer's traffic on. It is empty when traffic follows the
 	// ordinary rules, which is also the case when path probing is off.
@@ -390,6 +396,7 @@ func copyHostInfo(h *HostInfo, preferredRanges []netip.Prefix) ControlHostInfo {
 		RemoteAddrs:            h.remotes.CopyAddrs(preferredRanges),
 		CurrentRelaysToMe:      h.relayState.CopyRelayIps(),
 		CurrentRelaysThroughMe: h.relayState.CopyRelayForIps(),
+		ForwardingFor:          h.relayState.CopyForwardingPeers(),
 		CurrentRemote:          h.GetRemote(),
 		PinnedRelay:            h.PinnedRelay(),
 	}

@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A relay may now use relays of its own. Forwarding for others and being
   forwarded are independent, and tying them together left a relay walking a
   bad direct route instead of a short relayed one. Chains still cannot form.
+- `list-hostmap` and `print-tunnel` report a new `forwardingFor` field: the
+  peers this node is carrying that peer's traffic to and from. The
+  `currentRelaysThroughMe` field beside it is not that number and never was: it
+  also counts relays where this node is the far end rather than the carrier,
+  and relays that were only asked for or have since been torn down, so a node
+  forwarding nothing at all could look loaded.
 - `timers.rehandshake_interval` makes an established tunnel run the handshake
   again on a schedule, so a better path can win. Nebula picks a remote once,
   during the handshake, and never revisits that choice: a tunnel that fell back

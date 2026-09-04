@@ -402,6 +402,48 @@ func TestHostMap_RelayState(t *testing.T) {
 
 }
 
+// relayForByAddr holds both kinds of relay: ones where this host FORWARDS
+// somebody else's traffic, and ones where it is the far end. Counting the mix
+// as "traffic I carry" reported a node with am_relay: false as carrying 64
+// pairs, which is how this was found.
+func TestRelayState_CopyForwardingPeers(t *testing.T) {
+	carried := netip.MustParseAddr("10.0.0.31")
+	viaMe := netip.MustParseAddr("10.0.0.32")
+	toMe := netip.MustParseAddr("10.0.0.11")
+
+	rs := &RelayState{relayForByAddr: map[netip.Addr]*Relay{
+		carried: {Type: ForwardingType, PeerAddr: carried, State: Established},
+		viaMe:   {Type: ForwardingType, PeerAddr: viaMe, State: Established},
+		toMe:    {Type: TerminalType, PeerAddr: toMe, State: Established},
+	}}
+
+	fwd := rs.CopyForwardingPeers()
+	assert.Len(t, fwd, 2, "only forwarded peers count as traffic this host carries")
+	assert.NotContains(t, fwd, toMe, "being the far end of a relay is not carrying it")
+	assert.Len(t, rs.CopyRelayForIps(), 3, "the mixed list still holds all three")
+}
+
+// Nothing is ever deleted from relayForByAddr, so a host that has stopped
+// forwarding, or never started, keeps its entry with the state changed. Only an
+// Established relay moves a packet, and only those may be reported: otherwise a
+// node that asked for a relay once and never got it looks busy for as long as
+// the tunnel lives.
+func TestRelayState_CopyForwardingPeers_OnlyEstablished(t *testing.T) {
+	established := netip.MustParseAddr("10.0.0.31")
+	requested := netip.MustParseAddr("10.0.0.32")
+	peerRequested := netip.MustParseAddr("10.0.0.33")
+	gone := netip.MustParseAddr("10.0.0.34")
+
+	rs := &RelayState{relayForByAddr: map[netip.Addr]*Relay{
+		established:   {Type: ForwardingType, PeerAddr: established, State: Established},
+		requested:     {Type: ForwardingType, PeerAddr: requested, State: Requested},
+		peerRequested: {Type: ForwardingType, PeerAddr: peerRequested, State: PeerRequested},
+		gone:          {Type: ForwardingType, PeerAddr: gone, State: Disestablished},
+	}}
+
+	assert.Equal(t, []netip.Addr{established}, rs.CopyForwardingPeers())
+}
+
 // sentSinceCheck reports whether anything has been sent since the connection manager last looked. Test only:
 // production reads the out bit through takeTraffic on the connection manager tick.
 func (i *HostInfo) sentSinceCheck() bool {
