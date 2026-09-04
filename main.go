@@ -322,6 +322,14 @@ func Main(c *config.C, configTest bool, buildVersion string, l *slog.Logger, dev
 		return nil, util.ContextualizeIfNeeded("Failed to start stats emitter", err)
 	}
 
+	// Built here, before the config test returns, so a status.listen that is not
+	// an address fails `nebula -test` rather than the next restart. The Control
+	// it reports on does not exist yet and is attached below.
+	status, err := newStatusServerFromConfig(ctx, l, c, buildVersion)
+	if err != nil {
+		return nil, util.ContextualizeIfNeeded("Failed to configure the status listener", err)
+	}
+
 	if configTest {
 		return nil, nil
 	}
@@ -332,7 +340,7 @@ func Main(c *config.C, configTest bool, buildVersion string, l *slog.Logger, dev
 
 	networkChanges := udp.NewNetworkChangeMonitor(ctx, l, c)
 
-	return &Control{
+	ctrl := &Control{
 		state:                  StateReady,
 		f:                      ifce,
 		l:                      l,
@@ -344,7 +352,12 @@ func Main(c *config.C, configTest bool, buildVersion string, l *slog.Logger, dev
 		lighthouseStart:        lightHouse.StartUpdateWorker,
 		networkChangeStart:     networkChanges.Start,
 		connectionManagerStart: connManager.Start,
-	}, nil
+	}
+
+	status.attach(ctrl)
+	ctrl.statusStart = status.Start
+
+	return ctrl, nil
 }
 
 // parseCpuAffinity reads `tun.cpu_affinity` from the config — a list of

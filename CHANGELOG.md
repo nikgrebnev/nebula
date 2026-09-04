@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   also counts relays where this node is the far end rather than the carrier,
   and relays that were only asked for or have since been torn down, so a node
   forwarding nothing at all could look loaded.
+- `status.listen` serves this node's tunnel state over HTTP: which peers are
+  up, which path each one is using, which relay its traffic is pinned to, and
+  which peers are forwarded through this node. `GET /status` for a page,
+  `GET /status.json` for the same report as JSON. Off unless configured, and
+  reloadable.
 - `timers.rehandshake_interval` makes an established tunnel run the handshake
   again on a schedule, so a better path can win. Nebula picks a remote once,
   during the handshake, and never revisits that choice: a tunnel that fell back

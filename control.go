@@ -51,6 +51,7 @@ type Control struct {
 	cancel                 context.CancelFunc
 	sshStart               func()
 	statsStart             func()
+	statusStart            func()
 	dnsStart               func()
 	lighthouseStart        func()
 	networkChangeStart     func(rebind func())
@@ -113,6 +114,9 @@ func (c *Control) Start() error {
 	}
 	if c.statsStart != nil {
 		go c.statsStart()
+	}
+	if c.statusStart != nil {
+		go c.statusStart()
 	}
 	if c.dnsStart != nil {
 		go c.dnsStart()
@@ -414,6 +418,44 @@ func copyHostInfo(h *HostInfo, preferredRanges []netip.Prefix) ControlHostInfo {
 	}
 
 	return chi
+}
+
+// copyHostInfoForPath fills in the fields that describe where a peer's traffic
+// goes and nothing else. copyHostInfo above also copies the peer's certificate
+// and its whole remote list, and a caller that only wants the path pays for
+// both: a deep copy of a certificate per peer, taken while the hostmap read
+// lock is held and thrown away with the answer, is enough to make a node with
+// hundreds of tunnels stall tunnel setup for whoever is polling it.
+func copyHostInfoForPath(h *HostInfo) ControlHostInfo {
+	chi := ControlHostInfo{
+		VpnAddrs:          make([]netip.Addr, len(h.vpnAddrs)),
+		LocalIndex:        h.localIndexId,
+		RemoteIndex:       h.remoteIndexId,
+		CurrentRelaysToMe: h.relayState.CopyRelayIps(),
+		ForwardingFor:     h.relayState.CopyForwardingPeers(),
+		CurrentRemote:     h.GetRemote(),
+		PinnedRelay:       h.PinnedRelay(),
+	}
+
+	copy(chi.VpnAddrs, h.vpnAddrs)
+
+	if h.ConnectionState != nil {
+		chi.MessageCounter = h.ConnectionState.messageCounter.Load()
+	}
+
+	return chi
+}
+
+// listHostmapPaths is ListHostmapHosts without the parts nobody asking about
+// paths reads. It is unexported on purpose: the ControlHostInfo it returns is
+// deliberately incomplete, so it is not something to hand to a caller who
+// expects the whole thing.
+func (c *Control) listHostmapPaths() []ControlHostInfo {
+	hosts := make([]ControlHostInfo, 0)
+	c.f.hostMap.ForEachVpnAddr(func(hostinfo *HostInfo) {
+		hosts = append(hosts, copyHostInfoForPath(hostinfo))
+	})
+	return hosts
 }
 
 func listHostMapHosts(hl controlHostLister) []ControlHostInfo {
