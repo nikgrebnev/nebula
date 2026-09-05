@@ -7,10 +7,14 @@ import (
 	"testing"
 
 	"github.com/gaissmai/bart"
+	"github.com/rcrowley/go-metrics"
 	"github.com/slackhq/nebula/firewall"
+	"github.com/slackhq/nebula/header"
 	"github.com/slackhq/nebula/iputil"
+	"github.com/slackhq/nebula/overlay/batch"
 	"github.com/slackhq/nebula/overlay/tio"
 	"github.com/slackhq/nebula/test"
+	"github.com/slackhq/nebula/udp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -180,6 +184,60 @@ func l4ChecksumValid4(pkt []byte) bool {
 	ihl := int(pkt[0]&0x0f) << 2
 	l4 := pkt[ihl:]
 	return fold(sumBytes(l4, sumBytes(pkt[12:20], uint32(pkt[9])+uint32(len(l4))))) == 0xffff
+}
+
+// TestNoPathDropped covers the two outbound sends that give up when a peer has
+// no direct remote and no relay resolves. Neither drop leaves any other trace:
+// an empty relay list runs the resolve loop zero times, so nothing is logged,
+// and the message counter is spent before the send is attempted, so the far
+// side reports the missing counters as lost traffic of its own.
+func TestNoPathDropped(t *testing.T) {
+	// newNoPathPeer builds the smallest interface that can reach both drops,
+	// plus a peer with no remote and no relays.
+	newNoPathPeer := func(t *testing.T) (*Interface, *HostInfo) {
+		t.Helper()
+
+		initR, _ := runTestHandshake(t)
+		ci, err := newConnectionStateFromResult(initR)
+		require.NoError(t, err)
+
+		f := &Interface{
+			l:                   test.NewLogger(),
+			writers:             []udp.Conn{udp.NoopConn{}},
+			connectionManager:   &connectionManager{},
+			metricNoPathDropped: metrics.NewCounter(),
+		}
+		f.connectionManager.intf = f
+
+		hostinfo := &HostInfo{
+			vpnAddrs:        []netip.Addr{netip.MustParseAddr("10.0.0.1")},
+			ConnectionState: ci,
+		}
+		require.False(t, hostinfo.GetRemote().IsValid(), "the peer must have no direct remote")
+		require.Empty(t, hostinfo.relayState.CopyRelayIps(), "the peer must have no relays")
+
+		return f, hostinfo
+	}
+
+	t.Run("sendInsideMessage", func(t *testing.T) {
+		f, hostinfo := newNoPathPeer(t)
+		sb := batch.NewSendBatch(udp.NoopConn{}, batch.SendBatchCap, batch.SendBatchCap*(udp.MTU+32))
+		pkt := buildIPv4(netip.MustParseAddr("10.0.0.2"), netip.MustParseAddr("10.0.0.1"), udpDatagram)
+
+		f.sendInsideMessage(hostinfo, tio.Packet{Bytes: pkt}, make([]byte, 12), sb)
+
+		assert.Equal(t, int64(1), f.metricNoPathDropped.Count())
+		assert.Equal(t, 0, sb.Len(), "a packet with no path must not be queued for the wire")
+	})
+
+	t.Run("sendNoMetrics", func(t *testing.T) {
+		f, hostinfo := newNoPathPeer(t)
+
+		f.sendNoMetrics(header.Message, 0, hostinfo.ConnectionState, hostinfo, netip.AddrPort{},
+			[]byte("payload"), make([]byte, 12), make([]byte, mtu), 0)
+
+		assert.Equal(t, int64(1), f.metricNoPathDropped.Count())
+	})
 }
 
 // TestConsumeInsidePacketSelfTraffic covers the self-addressed branch of

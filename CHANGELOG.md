@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A `hostinfo.no_path.dropped` counter for outbound packets discarded because the peer has no direct address
+  and no relay could be resolved. These drops were silent, and since the packet's message counter is spent
+  before the send is attempted, the only trace was on the far side, which counted them as lost traffic.
+
 ### Changed
 
 - IPv6 packets whose next header is a protocol Nebula does not parse (SCTP, GRE, IP-in-IP, etc.) are now

@@ -193,7 +193,10 @@ func (f *Interface) sendInsideMessage(hostinfo *HostInfo, pkt tio.Packet, nb []b
 			break
 		}
 		if relayHostInfo == nil || relay == nil {
-			//failure already logged
+			// Every relay that failed to resolve logged as the loop went, but a peer
+			// with an empty relay list runs that loop zero times and logs nothing.
+			// Either way this packet has no path out and is dropped here.
+			f.metricNoPathDropped.Inc(1)
 			return
 		}
 
@@ -597,6 +600,7 @@ func (f *Interface) sendNoMetrics(t header.MessageType, st header.MessageSubType
 		}
 	} else {
 		// Try to send via a relay
+		sent := false
 		for _, relayIP := range hostinfo.relayState.CopyRelayIps() {
 			relayHostInfo, relay, err := f.hostMap.QueryVpnAddrsRelayFor(hostinfo.vpnAddrs, relayIP)
 			if err != nil {
@@ -608,7 +612,14 @@ func (f *Interface) sendNoMetrics(t header.MessageType, st header.MessageSubType
 				continue
 			}
 			f.SendVia(relayHostInfo, relay, out, nb, fullOut[:header.Len+len(out)], true, q)
+			sent = true
 			break
+		}
+		if !sent {
+			// No direct remote and no relay resolved. The message counter was spent
+			// above, so this packet is dropped after the peer has been told to
+			// expect it.
+			f.metricNoPathDropped.Inc(1)
 		}
 	}
 }

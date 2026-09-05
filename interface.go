@@ -134,6 +134,10 @@ type Interface struct {
 	messageMetrics      *MessageMetrics
 	cachedPacketMetrics *cachedPacketMetrics
 	metricTxDropped     metrics.Counter
+	// metricNoPathDropped counts outbound packets discarded because the peer has
+	// no direct remote and no relay resolved, the one send failure nothing else
+	// records.
+	metricNoPathDropped metrics.Counter
 
 	l *slog.Logger
 }
@@ -231,9 +235,10 @@ func NewInterface(ctx context.Context, c *InterfaceConfig) (*Interface, error) {
 		cpuAffinity:           c.CpuAffinity,
 		pinThreads:            c.PinThreads,
 
-		metricHandshakes: metrics.GetOrRegisterHistogram("handshakes", nil, metrics.NewExpDecaySample(1028, 0.015)),
-		metricTxDropped:  metrics.GetOrRegisterCounter("udp.tx.dropped", nil),
-		messageMetrics:   c.MessageMetrics,
+		metricHandshakes:    metrics.GetOrRegisterHistogram("handshakes", nil, metrics.NewExpDecaySample(1028, 0.015)),
+		metricTxDropped:     metrics.GetOrRegisterCounter("udp.tx.dropped", nil),
+		metricNoPathDropped: metrics.GetOrRegisterCounter("hostinfo.no_path.dropped", nil),
+		messageMetrics:      c.MessageMetrics,
 		cachedPacketMetrics: &cachedPacketMetrics{
 			sent:    metrics.GetOrRegisterCounter("hostinfo.cached_packets.sent", nil),
 			dropped: metrics.GetOrRegisterCounter("hostinfo.cached_packets.dropped", nil),
